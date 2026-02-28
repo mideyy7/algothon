@@ -476,14 +476,14 @@ class TestFlightsFetcherMocked(unittest.TestCase):
         Each flight gets a distinct minute within the window.
         """
         arrivals = [
-            {"arrival": {"scheduledTime": {
-                "local": f"{base_dt}T{start_hour + (i * 2 // 60):02d}:{(i * 2) % 60:02d}+00:00"
+            {"movement": {"scheduledTime": {
+                "local": f"{base_dt} {start_hour + (i * 2 // 60):02d}:{(i * 2) % 60:02d}+00:00"
             }}}
             for i in range(n_arrivals)
         ]
         departures = [
-            {"departure": {"scheduledTime": {
-                "local": f"{base_dt}T{start_hour + (i * 2 // 60):02d}:{(i * 2) % 60:02d}+00:00"
+            {"movement": {"scheduledTime": {
+                "local": f"{base_dt} {start_hour + (i * 2 // 60):02d}:{(i * 2) % 60:02d}+00:00"
             }}}
             for i in range(n_departures)
         ]

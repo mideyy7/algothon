@@ -160,7 +160,7 @@ class DataPipeline:
     ):
         self.window_start = window_start
         self.window_end   = window_end
-        self.skip_flights = skip_flights or (RAPIDAPI_KEY == "YOUR_RAPIDAPI_KEY_HERE")
+        self.skip_flights = skip_flights or not RAPIDAPI_KEY
 
         if self.skip_flights:
             log.warning(

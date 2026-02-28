@@ -1,25 +1,24 @@
-"""Pipeline configuration.
-
-USER SETUP REQUIRED
--------------------
-Only ONE thing needs your input: set RAPIDAPI_KEY below.
-
-Thames (Market 1, 2) and Weather (Market 3, 4) APIs are completely free
-with no authentication needed.
-
-Flights (Market 5, 6) and the London ETF (Market 7, 8) require a
-RapidAPI key for AeroDataBox. Steps:
-  1. Go to https://rapidapi.com/aedbx-aedbx/api/aerodatabox
-  2. Subscribe to a plan (Basic free tier gives 500 calls/month)
-  3. Copy your key from "Header Parameters" → "X-RapidAPI-Key"
-  4. Paste it below.
+"""
+Pipeline configuration.
+API KEY SETUP
+-------------
+Your RapidAPI key is loaded automatically from the .env file in the project root.
+The .env file should contain:
+    RAPID_API_KEY = your_key_here
+Thames (Market 1, 2) and Weather (Market 3, 4) APIs are free — no key needed.
+Flights (Market 5, 6, 7, 8) require the RapidAPI key for AeroDataBox.
 """
 
-# =============================================================================
-# USER: Paste your RapidAPI key here (required for Heathrow flight data).
-# Without this, Markets 5, 6, and the ETF/options legs will show None.
-# =============================================================================
-RAPIDAPI_KEY = "YOUR_RAPIDAPI_KEY_HERE"
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load variables from .env in the project root (one level up from this file)
+_env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(_env_path)
+
+# .env uses RAPID_API_KEY (with underscore); returns None if not set
+RAPIDAPI_KEY: str = os.environ.get("RAPID_API_KEY")
 
 RAPIDAPI_HOST = "aerodatabox.p.rapidapi.com"
 

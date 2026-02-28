@@ -142,28 +142,35 @@ def _fetch_chunk(
             arrival_dts: list[datetime] = []
             departure_dts: list[datetime] = []
 
-            def _parse_flight_time(flight: dict, key: str) -> Optional[datetime]:
-                """Extract the best available timestamp from a flight dict."""
-                leg = flight.get(key, {})
-                # Prefer actual time (flight has happened); fall back to scheduled
-                for time_key in ("actualTime", "scheduledTime"):
+            def _parse_flight_time(flight: dict) -> Optional[datetime]:
+                """Extract the best available timestamp from a flight dict.
+
+                AeroDataBox response structure (current):
+                  flight["movement"]["runwayTime"]["local"]   — actual wheels on/off runway
+                  flight["movement"]["revisedTime"]["local"]  — gate revised time
+                  flight["movement"]["scheduledTime"]["local"] — original schedule
+                Both arrivals and departures use "movement" as the timing key.
+                """
+                leg = flight.get("movement", {})
+                # Prefer actual runway time, then revised, then scheduled
+                for time_key in ("runwayTime", "revisedTime", "scheduledTime"):
                     t = leg.get(time_key, {})
                     local_str = t.get("local")
                     if local_str:
                         try:
-                            # Local strings look like "2025-11-22T14:05+00:00"
+                            # Strings look like "2026-02-28 12:00+00:00"
                             return datetime.fromisoformat(local_str).astimezone(_LONDON_TZ)
                         except ValueError:
                             pass
                 return None
 
             for flight in data.get("departures", []):
-                dt = _parse_flight_time(flight, "departure")
+                dt = _parse_flight_time(flight)
                 if dt:
                     departure_dts.append(dt)
 
             for flight in data.get("arrivals", []):
-                dt = _parse_flight_time(flight, "arrival")
+                dt = _parse_flight_time(flight)
                 if dt:
                     arrival_dts.append(dt)
 
