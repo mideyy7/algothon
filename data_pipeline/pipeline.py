@@ -135,6 +135,26 @@ class PipelineSnapshot:
     flight_intervals: list[FlightInterval]      = field(default_factory=list)
     estimates:        MarketEstimates           = field(default_factory=MarketEstimates)
     errors:           dict[str, str]            = field(default_factory=dict)
+    
+    @property
+    def raw_api_data(self) -> dict[str, list[dict]]:
+        """Returns the purely raw, uncalculated components as simple dictionaries
+        for standard quantitative ingestion.
+        """
+        return {
+            "THAMES_WATER_LEVELS": [
+                {"timestamp": r.dt.isoformat(), "level": r.value_maod} 
+                for r in self.thames_readings
+            ],
+            "WEATHER_FORECASTS": [
+                {"timestamp": r.dt.isoformat(), "temp_f": r.temp_f, "humidity": r.humidity} 
+                for r in self.weather_readings
+            ],
+            "FLIGHT_BUCKETS": [
+                {"timestamp": r.bucket_start.isoformat(), "arrivals": r.arrivals, "departures": r.departures} 
+                for r in self.flight_intervals
+            ]
+        }
 
 
 # ---------------------------------------------------------------------------
