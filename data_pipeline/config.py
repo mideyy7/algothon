@@ -10,7 +10,7 @@ _env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(_env_path)
 
 # .env uses RAPID_API_KEY (with underscore); returns None if not set
-RAPIDAPI_KEY: str = os.environ.get("RAPID_API_KEY")
+RAPIDAPI_KEY = os.environ.get("RAPID_API_KEY")
 
 RAPIDAPI_HOST = "aerodatabox.p.rapidapi.com"
 
