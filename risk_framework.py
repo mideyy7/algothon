@@ -7,6 +7,7 @@ import quantstats as qs
 # ====== assume these already exist in your codebase ======
 # get_live_ranking() -> dict like {"rank": 12, "score": 103.2, "leader_score": 115.7, "metric": "pnl"}
 # get_latest_state() -> dict / snapshot your model needs (market/features/etc.)
+# current_positions() -> dict mapping symbol to current net position (e.g. {"TIDE_SPOT": 20})
 # model_predict(state) -> pd.DataFrame with columns ["symbol","side","price","qty","confidence"]
 # submit_orders(df_orders) -> None
 # get_recent_pnl_series(window=500) -> pd.Series indexed by time, returns cumulative or step pnl
@@ -49,10 +50,31 @@ def risk_budget_from_prize(expected_pnl: float, risk: dict, pressure: float) -> 
     return {"aggression": aggression, "max_qty_mult": aggression, "min_conf": 0.45 + 0.15 / aggression}
 
 
-def adjust_orders(orders: pd.DataFrame, budget: dict) -> pd.DataFrame:
+def adjust_orders(orders: pd.DataFrame, budget: dict, current_positions: dict) -> pd.DataFrame:
     df = orders.copy()
     df["qty"] = np.floor(df["qty"].to_numpy() * budget["max_qty_mult"]).astype(int)
     df = df[df["confidence"] >= budget["min_conf"]]
+
+    # CRITICAL IMC RULE: ±100 net position limit per product. Exceeding this = permanent ban.
+    # We must cap the qty we try to buy or sell based on our current position.
+    allowed_qtys = []
+    for _, row in df.iterrows():
+        sym = row["symbol"]
+        side = row["side"].upper()
+        qty = row["qty"]
+        pos = current_positions.get(sym, 0)
+
+        if side == "BUY":
+            # Max we can buy is (100 - current position)
+            space_left = max(0, 100 - pos)
+        else:
+            # Max we can sell is (100 + current position) -> going short down to -100
+            space_left = max(0, 100 + pos)
+
+        final_qty = min(qty, space_left)
+        allowed_qtys.append(final_qty)
+
+    df["qty"] = allowed_qtys
     df = df[df["qty"] > 0]
     return df.reset_index(drop=True)
 
@@ -66,8 +88,9 @@ def run_live_loop(prize_curve: pd.DataFrame, sleep_s: float = 0.3):
         pressure = prize_pressure(live)
         budget = risk_budget_from_prize(expected_pnl, risk, pressure)
         state = get_latest_state()
+        pos = current_positions()
         raw_orders = model_predict(state)
-        final_orders = adjust_orders(raw_orders, budget)
+        final_orders = adjust_orders(raw_orders, budget, pos)
         submit_orders(final_orders)
         time.sleep(sleep_s)
 
