@@ -363,7 +363,7 @@ class TestDerivedMarkets(unittest.TestCase):
 
 class TestThamesFetcherMocked(unittest.TestCase):
 
-    @patch("data_pipeline.thames.requests.get")
+    @patch("data_pipeline.thames.http_session.get")
     def test_fetch_thames_parses_correctly(self, mock_get):
         """Verify the fetcher parses the EA API response format correctly."""
         from data_pipeline.thames import fetch_thames_readings
@@ -389,7 +389,7 @@ class TestThamesFetcherMocked(unittest.TestCase):
         # Verify values
         self.assertAlmostEqual(readings[2].value_maod, -1.41, places=3)
 
-    @patch("data_pipeline.thames.requests.get")
+    @patch("data_pipeline.thames.http_session.get")
     def test_fetch_thames_handles_missing_fields(self, mock_get):
         """Items with missing dateTime or value should be silently skipped."""
         from data_pipeline.thames import fetch_thames_readings
@@ -412,7 +412,7 @@ class TestThamesFetcherMocked(unittest.TestCase):
 
 class TestWeatherFetcherMocked(unittest.TestCase):
 
-    @patch("data_pipeline.weather.requests.get")
+    @patch("data_pipeline.weather.http_session.get")
     def test_fetch_weather_parses_correctly(self, mock_get):
         """Verify the fetcher handles Open-Meteo's minutely_15 structure."""
         from data_pipeline.weather import fetch_weather_readings
@@ -439,7 +439,7 @@ class TestWeatherFetcherMocked(unittest.TestCase):
         self.assertAlmostEqual(readings[0].temp_f, 33.0, places=2)
         self.assertEqual(readings[0].humidity, 29)
 
-    @patch("data_pipeline.weather.requests.get")
+    @patch("data_pipeline.weather.http_session.get")
     def test_fetch_weather_filters_to_window(self, mock_get):
         """Readings outside [start, end] should be excluded."""
         from data_pipeline.weather import fetch_weather_readings
@@ -489,7 +489,7 @@ class TestFlightsFetcherMocked(unittest.TestCase):
         ]
         return {"arrivals": arrivals, "departures": departures}
 
-    @patch("data_pipeline.flights.requests.get")
+    @patch("data_pipeline.flights.http_session.get")
     def test_fetch_flight_intervals_counts_correctly(self, mock_get):
         """End-to-end: fetched flights should be bucketed and counted."""
         from data_pipeline.flights import fetch_flight_intervals, compute_lhr_count
@@ -515,7 +515,7 @@ class TestFlightsFetcherMocked(unittest.TestCase):
         total = compute_lhr_count(intervals)
         self.assertEqual(total, 10 + 8 + 5 + 7)  # 30
 
-    @patch("data_pipeline.flights.requests.get")
+    @patch("data_pipeline.flights.http_session.get")
     def test_fetch_flights_raises_on_bad_api_key(self, mock_get):
         """A 401 response should raise RuntimeError immediately (no retry)."""
         from data_pipeline.flights import fetch_flight_intervals
@@ -526,7 +526,7 @@ class TestFlightsFetcherMocked(unittest.TestCase):
         mock_get.return_value = mock_resp
 
         with self.assertRaises(RuntimeError) as ctx:
-            fetch_flight_intervals(_london(2025, 11, 22, 12, 0), _london(2025, 11, 23, 12, 0))
+            fetch_flight_intervals(_london(2030, 11, 22, 12, 0), _london(2030, 11, 23, 12, 0))
 
         self.assertIn("API key", str(ctx.exception))
 

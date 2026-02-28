@@ -49,6 +49,8 @@ class MarketEstimates:
         m7_lon_etf:    Market 7 — LON_ETF (derived)
         m8_lon_fly:    Market 8 — LON_FLY (derived)
         window_elapsed_fraction: 0.0 → 1.0, how far through the 24-h window.
+        current_raw_data: A dict containing the latest raw values even if the 
+                          true settlement is None (useful for Quants predicting models)
     """
     m1_tide_spot:  Optional[float] = None
     m2_tide_swing: Optional[float] = None
@@ -59,10 +61,11 @@ class MarketEstimates:
     m7_lon_etf:    Optional[float] = None
     m8_lon_fly:    Optional[float] = None
     window_elapsed_fraction: float = 0.0
+    current_raw_data: dict[str, Optional[float]] = None  # type: ignore
 
-    def as_dict(self) -> dict[str, Optional[float]]:
+    def as_dict(self, include_raw: bool = False) -> dict[str, Optional[float]]:
         """Return estimates keyed by CMI product name."""
-        return {
+        base = {
             "TIDE_SPOT":  self.m1_tide_spot,
             "TIDE_SWING": self.m2_tide_swing,
             "WX_SPOT":    self.m3_wx_spot,
@@ -72,6 +75,9 @@ class MarketEstimates:
             "LON_ETF":    self.m7_lon_etf,
             "LON_FLY":    self.m8_lon_fly,
         }
+        if include_raw and self.current_raw_data:
+            base.update({f"RAW_{k}": v for k, v in self.current_raw_data.items()})
+        return base
 
 
 # ---------------------------------------------------------------------------

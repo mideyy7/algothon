@@ -312,6 +312,16 @@ class DataPipeline:
         m7 = compute_lon_etf(m1, m3, m5)
         m8 = compute_lon_fly(m7)
 
+        # --- Compute real-time "Current Raw" for Quants ---
+        raw_m1 = abs(thames[-1].value_maod) * 1000 if thames else None
+        
+        # We can calculate a "live" ETF using the real-time M1 and the current estimates for WX/LHR
+        raw_m7 = None
+        raw_m8 = None
+        if raw_m1 is not None and m3 is not None and m5 is not None:
+            raw_m7 = abs(raw_m1 + m3 + m5)
+            raw_m8 = compute_lon_fly(raw_m7)
+
         return MarketEstimates(
             m1_tide_spot=m1,
             m2_tide_swing=m2,
@@ -322,6 +332,11 @@ class DataPipeline:
             m7_lon_etf=m7,
             m8_lon_fly=m8,
             window_elapsed_fraction=elapsed_fraction,
+            current_raw_data={
+                "TIDE_SPOT": raw_m1,
+                "LON_ETF": raw_m7,
+                "LON_FLY": raw_m8
+            }
         )
 
     # ------------------------------------------------------------------

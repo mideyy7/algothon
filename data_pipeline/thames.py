@@ -24,7 +24,7 @@ from typing import Optional
 
 import requests
 
-from .config import MAX_RETRIES, REQUEST_TIMEOUT, RETRY_BACKOFF
+from .config import REQUEST_TIMEOUT, http_session
 
 log = logging.getLogger(__name__)
 
@@ -81,39 +81,32 @@ def fetch_thames_readings(
         "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(_READINGS_URL, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
+    try:
+        resp = http_session.get(_READINGS_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
 
-            readings: list[ThamesReading] = []
-            for item in items:
-                dt_str = item.get("dateTime", "")
-                value = item.get("value")
-                if not dt_str or value is None:
-                    continue
-                try:
-                    # API returns ISO 8601 with 'Z' suffix — normalise to +00:00
-                    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-                    readings.append(ThamesReading(dt=dt, value_maod=float(value)))
-                except (ValueError, TypeError) as exc:
-                    log.debug("Skipping malformed Thames item %s: %s", item, exc)
+        readings: list[ThamesReading] = []
+        for item in items:
+            dt_str = item.get("dateTime", "")
+            value = item.get("value")
+            if not dt_str or value is None:
+                continue
+            try:
+                # API returns ISO 8601 with 'Z' suffix — normalise to +00:00
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                readings.append(ThamesReading(dt=dt, value_maod=float(value)))
+            except (ValueError, TypeError) as exc:
+                log.debug("Skipping malformed Thames item %s: %s", item, exc)
 
-            # The API returns in descending order; reverse to ascending
-            readings.sort(key=lambda r: r.dt)
-            log.debug("Thames: fetched %d readings since %s", len(readings), since)
-            return readings
+        # The API returns in descending order; reverse to ascending
+        readings.sort(key=lambda r: r.dt)
+        log.debug("Thames: fetched %d readings since %s", len(readings), since)
+        return readings
 
-        except requests.RequestException as exc:
-            log.warning(
-                "Thames fetch attempt %d/%d failed: %s",
-                attempt + 1, MAX_RETRIES, exc,
-            )
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BACKOFF * (attempt + 1))
-
-    raise RuntimeError(f"Thames API unreachable after {MAX_RETRIES} attempts")
+    except requests.RequestException as exc:
+        log.error("Thames API unreachable: %s", exc)
+        raise RuntimeError(f"Thames API unreachable: {exc}")
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ import requests
 
 from .config import (
     LONDON_LAT, LONDON_LON, LONDON_TIMEZONE,
-    MAX_RETRIES, REQUEST_TIMEOUT, RETRY_BACKOFF,
+    REQUEST_TIMEOUT, http_session,
 )
 
 log = logging.getLogger(__name__)
@@ -94,51 +94,44 @@ def fetch_weather_readings(
         "forecast_days": 2,   # enough to cover Sunday noon
     }
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(_OPEN_METEO_URL, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
+    try:
+        resp = http_session.get(_OPEN_METEO_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
 
-            m15 = data.get("minutely_15", {})
-            times = m15.get("time", [])
-            temps = m15.get("temperature_2m", [])
-            humids = m15.get("relative_humidity_2m", [])
+        m15 = data.get("minutely_15", {})
+        times = m15.get("time", [])
+        temps = m15.get("temperature_2m", [])
+        humids = m15.get("relative_humidity_2m", [])
 
-            if not times:
-                log.warning("Open-Meteo returned no minutely_15 data")
-                return []
+        if not times:
+            log.warning("Open-Meteo returned no minutely_15 data")
+            return []
 
-            readings: list[WeatherReading] = []
-            for t_str, temp, humid in zip(times, temps, humids):
-                if temp is None or humid is None:
-                    continue
-                try:
-                    # Open-Meteo returns local datetime strings like "2025-11-22T14:15"
-                    dt = datetime.fromisoformat(t_str).replace(tzinfo=_LONDON_TZ)
-                    # Filter strictly to our market window
-                    if start_dt <= dt <= end_dt:
-                        readings.append(WeatherReading(
-                            dt=dt,
-                            temp_f=float(temp),
-                            humidity=int(round(humid)),
-                        ))
-                except (ValueError, TypeError) as exc:
-                    log.debug("Skipping malformed weather entry %s: %s", t_str, exc)
+        readings: list[WeatherReading] = []
+        for t_str, temp, humid in zip(times, temps, humids):
+            if temp is None or humid is None:
+                continue
+            try:
+                # Open-Meteo returns local datetime strings like "2025-11-22T14:15"
+                dt = datetime.fromisoformat(t_str).replace(tzinfo=_LONDON_TZ)
+                # Filter strictly to our market window
+                if start_dt <= dt <= end_dt:
+                    readings.append(WeatherReading(
+                        dt=dt,
+                        temp_f=float(temp),
+                        humidity=int(round(humid)),
+                    ))
+            except (ValueError, TypeError) as exc:
+                log.debug("Skipping malformed weather entry %s: %s", t_str, exc)
 
-            readings.sort(key=lambda r: r.dt)
-            log.debug("Weather: fetched %d readings for window", len(readings))
-            return readings
+        readings.sort(key=lambda r: r.dt)
+        log.debug("Weather: fetched %d readings for window", len(readings))
+        return readings
 
-        except requests.RequestException as exc:
-            log.warning(
-                "Weather fetch attempt %d/%d failed: %s",
-                attempt + 1, MAX_RETRIES, exc,
-            )
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BACKOFF * (attempt + 1))
-
-    raise RuntimeError(f"Open-Meteo API unreachable after {MAX_RETRIES} attempts")
+    except requests.RequestException as exc:
+        log.error("Weather API unreachable: %s", exc)
+        raise RuntimeError(f"Open-Meteo API unreachable: {exc}")
 
 
 # ---------------------------------------------------------------------------

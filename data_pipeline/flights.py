@@ -31,8 +31,9 @@ import requests
 
 from .config import (
     RAPIDAPI_KEY, RAPIDAPI_HOST,
-    MAX_RETRIES, REQUEST_TIMEOUT, RETRY_BACKOFF,
+    REQUEST_TIMEOUT,
     LONDON_TIMEZONE,
+    http_session,
 )
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,9 @@ _FLIGHTS_URL = "https://aerodatabox.p.rapidapi.com/flights/airports/iata/LHR"
 
 # AeroDataBox supports at most 12 h per request
 _MAX_WINDOW_HOURS = 12
+
+# In-memory cache for fully elapsed 12-hour flight chunks to save RapidAPI quota
+_historical_chunk_cache: dict[tuple[datetime, datetime], tuple[list[datetime], list[datetime]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +113,13 @@ def _fetch_chunk(
     local_end   = chunk_end.astimezone(_LONDON_TZ).strftime(fmt)
     url = f"{_FLIGHTS_URL}/{local_start}/{local_end}"
 
+    # Check if historical chunk has already been fetched
+    now = datetime.now(_LONDON_TZ)
+    is_historical = chunk_end < now
+    if is_historical and (chunk_start, chunk_end) in _historical_chunk_cache:
+        log.debug("Flights chunk %s→%s loaded from historical cache", local_start, local_end)
+        return _historical_chunk_cache[(chunk_start, chunk_end)]
+
     # Additional filters to exclude cargo, private jets, and codeshares
     # (these typically aren't counted in published airport statistics)
     params = {
@@ -120,80 +131,72 @@ def _fetch_chunk(
         "withLocation": "false",
     }
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(
-                url,
-                params=params,
-                headers=_rapidapi_headers(),
-                timeout=REQUEST_TIMEOUT,
+    try:
+        resp = http_session.get(
+            url,
+            params=params,
+            headers=_rapidapi_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        # 401/403 almost always means the API key is wrong or missing
+        if resp.status_code in (401, 403):
+            raise RuntimeError(
+                "AeroDataBox API key rejected (HTTP %d). "
+                "Check RAPIDAPI_KEY in data_pipeline/config.py." % resp.status_code
             )
 
-            # 401/403 almost always means the API key is wrong or missing
-            if resp.status_code in (401, 403):
-                raise RuntimeError(
-                    "AeroDataBox API key rejected (HTTP %d). "
-                    "Check RAPIDAPI_KEY in data_pipeline/config.py." % resp.status_code
-                )
+        resp.raise_for_status()
+        data = resp.json()
 
-            resp.raise_for_status()
-            data = resp.json()
+        arrival_dts: list[datetime] = []
+        departure_dts: list[datetime] = []
 
-            arrival_dts: list[datetime] = []
-            departure_dts: list[datetime] = []
+        def _parse_flight_time(flight: dict) -> Optional[datetime]:
+            """Extract the best available timestamp from a flight dict.
 
-            def _parse_flight_time(flight: dict) -> Optional[datetime]:
-                """Extract the best available timestamp from a flight dict.
+            AeroDataBox response structure (current):
+              flight["movement"]["runwayTime"]["local"]   — actual wheels on/off runway
+              flight["movement"]["revisedTime"]["local"]  — gate revised time
+              flight["movement"]["scheduledTime"]["local"] — original schedule
+            Both arrivals and departures use "movement" as the timing key.
+            """
+            leg = flight.get("movement", {})
+            # Prefer actual runway time, then revised, then scheduled
+            for time_key in ("runwayTime", "revisedTime", "scheduledTime"):
+                t = leg.get(time_key, {})
+                local_str = t.get("local")
+                if local_str:
+                    try:
+                        # Strings look like "2026-02-28 12:00+00:00"
+                        return datetime.fromisoformat(local_str).astimezone(_LONDON_TZ)
+                    except ValueError:
+                        pass
+            return None
 
-                AeroDataBox response structure (current):
-                  flight["movement"]["runwayTime"]["local"]   — actual wheels on/off runway
-                  flight["movement"]["revisedTime"]["local"]  — gate revised time
-                  flight["movement"]["scheduledTime"]["local"] — original schedule
-                Both arrivals and departures use "movement" as the timing key.
-                """
-                leg = flight.get("movement", {})
-                # Prefer actual runway time, then revised, then scheduled
-                for time_key in ("runwayTime", "revisedTime", "scheduledTime"):
-                    t = leg.get(time_key, {})
-                    local_str = t.get("local")
-                    if local_str:
-                        try:
-                            # Strings look like "2026-02-28 12:00+00:00"
-                            return datetime.fromisoformat(local_str).astimezone(_LONDON_TZ)
-                        except ValueError:
-                            pass
-                return None
+        for flight in data.get("departures", []):
+            dt = _parse_flight_time(flight)
+            if dt:
+                departure_dts.append(dt)
 
-            for flight in data.get("departures", []):
-                dt = _parse_flight_time(flight)
-                if dt:
-                    departure_dts.append(dt)
+        for flight in data.get("arrivals", []):
+            dt = _parse_flight_time(flight)
+            if dt:
+                arrival_dts.append(dt)
 
-            for flight in data.get("arrivals", []):
-                dt = _parse_flight_time(flight)
-                if dt:
-                    arrival_dts.append(dt)
+        log.debug(
+            "Flights chunk %s→%s: %d arrivals, %d departures",
+            local_start, local_end, len(arrival_dts), len(departure_dts),
+        )
 
-            log.debug(
-                "Flights chunk %s→%s: %d arrivals, %d departures",
-                local_start, local_end, len(arrival_dts), len(departure_dts),
-            )
-            return arrival_dts, departure_dts
+        if is_historical:
+            _historical_chunk_cache[(chunk_start, chunk_end)] = (arrival_dts, departure_dts)
 
-        except RuntimeError:
-            raise  # propagate auth errors immediately — no point retrying
-        except requests.RequestException as exc:
-            log.warning(
-                "Flights fetch attempt %d/%d failed: %s",
-                attempt + 1, MAX_RETRIES, exc,
-            )
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BACKOFF * (attempt + 1))
+        return arrival_dts, departure_dts
 
-    raise RuntimeError(
-        f"AeroDataBox API unreachable for {local_start}→{local_end} "
-        f"after {MAX_RETRIES} attempts"
-    )
+    except requests.RequestException as exc:
+        log.error("Flights API unreachable: %s", exc)
+        raise RuntimeError(f"AeroDataBox API unreachable: {exc}")
 
 
 def _assign_to_buckets(

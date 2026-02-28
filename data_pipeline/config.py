@@ -1,17 +1,9 @@
-"""
-Pipeline configuration.
-API KEY SETUP
--------------
-Your RapidAPI key is loaded automatically from the .env file in the project root.
-The .env file should contain:
-    RAPID_API_KEY = your_key_here
-Thames (Market 1, 2) and Weather (Market 3, 4) APIs are free — no key needed.
-Flights (Market 5, 6, 7, 8) require the RapidAPI key for AeroDataBox.
-"""
-
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Load variables from .env in the project root (one level up from this file)
 _env_path = Path(__file__).parent.parent / ".env"
@@ -35,13 +27,25 @@ REQUEST_TIMEOUT = 12    # seconds before a single request is abandoned
 MAX_RETRIES = 3         # how many times to retry on failure
 RETRY_BACKOFF = 2.0     # seconds; multiplied by attempt number on each retry
 
-# --- Cache time-to-live (seconds) ---
+# Cache time-to-live (seconds) ---
 # Thames data updates every 15 min — cache for 4 min so we catch updates fast
 THAMES_CACHE_TTL = 240
 # Open-Meteo updates its model every ~15 min — cache for 10 min
 WEATHER_CACHE_TTL = 600
-# Flights update continuously — cache for 3 min to stay fresh without hammering
-FLIGHTS_CACHE_TTL = 180
+# Flights update continuously — cache for 10 min to massively save on RapidAPI limit
+FLIGHTS_CACHE_TTL = 600
+
+# --- Global HTTP Session with auto-retries ---
+http_session = requests.Session()
+_retry_strategy = Retry(
+    total=MAX_RETRIES,
+    backoff_factor=RETRY_BACKOFF,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"]
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy)
+http_session.mount("https://", _adapter)
+http_session.mount("http://", _adapter)
 
 # --- CMI product names (must match what the exchange uses) ---
 MARKET_PRODUCTS = {
