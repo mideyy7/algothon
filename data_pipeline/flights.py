@@ -75,7 +75,7 @@ class FlightInterval:
 
 def _rapidapi_headers() -> dict[str, str]:
     return {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Key": RAPIDAPI_KEY or "",
         "X-RapidAPI-Host": RAPIDAPI_HOST,
     }
 

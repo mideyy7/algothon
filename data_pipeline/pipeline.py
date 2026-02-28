@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Optional
 import zoneinfo
 
 from .thames import (
@@ -93,9 +93,9 @@ class _TTLCache:
     """Thread-safe time-to-live cache (stores one value per key)."""
 
     def __init__(self):
-        self._store: dict[str, tuple[object, float]] = {}
+        self._store: dict[str, tuple[Any, float]] = {}
 
-    def get(self, key: str) -> Optional[object]:
+    def get(self, key: str) -> Any:
         entry = self._store.get(key)
         if entry is None:
             return None
@@ -105,7 +105,7 @@ class _TTLCache:
             return None
         return value
 
-    def set(self, key: str, value: object, ttl: float) -> None:
+    def set(self, key: str, value: Any, ttl: float) -> None:
         self._store[key] = (value, time.monotonic() + ttl)
 
 

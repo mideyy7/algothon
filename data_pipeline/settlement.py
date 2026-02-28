@@ -61,7 +61,7 @@ class MarketEstimates:
     m7_lon_etf:    Optional[float] = None
     m8_lon_fly:    Optional[float] = None
     window_elapsed_fraction: float = 0.0
-    current_raw_data: dict[str, Optional[float]] = None  # type: ignore
+    current_raw_data: Optional[dict[str, Optional[float]]] = None
 
     def as_dict(self, include_raw: bool = False) -> dict[str, Optional[float]]:
         """Return estimates keyed by CMI product name."""
