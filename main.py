@@ -41,7 +41,7 @@ if _ROOT not in sys.path:
 from imc_template.bot_template import BaseBot, OrderBook, OrderRequest, Trade, Side
 from data_pipeline import DataPipeline, get_market_window
 from quant_models import fill_missing_estimates
-from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageArb
+from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageImpliedVolArb, ETFBasketArb, BBO
 
 # ── Risk framework ─────────────────────────────────────────────────────────
 _RISK_AVAILABLE = False
@@ -129,8 +129,13 @@ class IMCBot(BaseBot):
             product="TIDE_SWING",
         )
 
-        # Strategy B: LON_FLY vs LON_ETF MC pricer (Markets 7 & 8)
-        self._etf_package_arb = ETFPackageArb(
+        # Strategy B: LON_ETF vs LON_FLY Implied Vol arb (Markets 7 & 8)
+        self._etf_package_arb = ETFPackageImpliedVolArb(
+            api=self._exchange_adapter,
+        )
+
+        # Strategy C: LON_ETF vs Basket Identity arb (Markets 1, 3, 5, 7)
+        self._etf_basket_arb = ETFBasketArb(
             api=self._exchange_adapter,
         )
 
@@ -168,10 +173,13 @@ class IMCBot(BaseBot):
         """
         product = orderbook.product
 
-        # ── Step 1: mid price ───────────────────────────────────────────────
-        mid = self._compute_mid(orderbook)
-        if mid is not None:
-            self._exchange_adapter.update_mid(product, mid)
+        # ── Step 1: mid price and BBO ───────────────────────────────────────
+        bbo = self._compute_bbo(orderbook)
+        if bbo.mid is not None and not np.isnan(bbo.mid):
+            self._exchange_adapter.update_bbo(product, bbo)
+            mid = bbo.mid
+        else:
+            mid = None
 
         # ── Step 2: stat-arb (unthrottled — own cooldowns govern frequency) ─
         self._run_arb(product, mid)
@@ -228,17 +236,24 @@ class IMCBot(BaseBot):
     # ── Mid-price helper ───────────────────────────────────────────────────
 
     @staticmethod
-    def _compute_mid(orderbook: OrderBook) -> Optional[float]:
-        """Return best-bid/ask mid, or the lone side if only one exists."""
+    def _compute_bbo(orderbook: OrderBook) -> BBO:
+        """Return BBO (mid, best_bid, best_ask) from the orderbook."""
         has_bid = bool(orderbook.buy_orders)
         has_ask = bool(orderbook.sell_orders)
+        
+        best_bid = float(orderbook.buy_orders[0].price) if has_bid else None
+        best_ask = float(orderbook.sell_orders[0].price) if has_ask else None
+        
         if has_bid and has_ask:
-            return (orderbook.buy_orders[0].price + orderbook.sell_orders[0].price) / 2.0
-        if has_bid:
-            return float(orderbook.buy_orders[0].price)
-        if has_ask:
-            return float(orderbook.sell_orders[0].price)
-        return None
+            mid = (best_bid + best_ask) / 2.0
+        elif has_bid:
+            mid = best_bid
+        elif has_ask:
+            mid = best_ask
+        else:
+            mid = float("nan")
+            
+        return BBO(mid=mid, best_bid=best_bid, best_ask=best_ask)
 
     # ── Stat-arb dispatcher ────────────────────────────────────────────────
 
@@ -256,14 +271,16 @@ class IMCBot(BaseBot):
                     log.info("TideSwingArb: %s", action)
 
             elif product in ("LON_ETF", "LON_FLY"):
-                etf_mid  = self._exchange_adapter.get_mid("LON_ETF")
-                pack_mid = self._exchange_adapter.get_mid("LON_FLY")
-                import math
-                if not (math.isnan(etf_mid) or math.isnan(pack_mid)):
-                    result = self._etf_package_arb.step(etf_mid=etf_mid, pack_mid=pack_mid)
-                    action = result.get("action", "")
-                    if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL"}:
-                        log.info("ETFPackageArb: %s", action)
+                result = self._etf_package_arb.step()
+                action = result.get("action", "")
+                if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL", "COOLDOWN", "CAPPED"}:
+                    log.info("ETFPackageArb: %s", action)
+
+            if product in ("LON_ETF", "TIDE_SPOT", "WX_SPOT", "LHR_COUNT"):
+                result = self._etf_basket_arb.step()
+                action = result.get("action", "")
+                if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL", "COOLDOWN", "CAPPED"}:
+                    log.info("ETFBasketArb: %s", action)
 
         except Exception:
             log.exception("Arb error for product %s", product)
@@ -309,17 +326,14 @@ class IMCBot(BaseBot):
         # Cancel existing resting orders for this product, then place fresh ones
         existing = self.get_orders(product)
         if existing:
-            cancel_threads = [
-                threading.Thread(target=self.cancel_order, args=(o["id"],))
-                for o in existing
-            ]
-            for t in cancel_threads:
-                t.start()
-            for t in cancel_threads:
-                t.join()
+            for o in existing:
+                try:
+                    self.cancel_order(o["id"])
+                except Exception:
+                    pass
 
         self.send_orders(orders)
-        log.debug(
+        log.info(
             "%s  bid=%.2f  ask=%.2f  size=%d  pos=%+d  aggression=%.2f",
             product, bid, ask, size, position, self._aggression,
         )

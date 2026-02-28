@@ -1,0 +1,809 @@
+Title slide
+To insert background:
+right click and select 
+“Format Background”
+Choose file
+Adjust using 
+the offset tool 
+if need be.
+Algothon
+IMCity
+ChallengeText 100% with gradient
+USING TEXT LEVELS
+1
+Home
+ Text level up
+Text level down
+2 •
+ Bullet
+3 •
+ Sub
+ -
+bullet
+4
+ Default text
+5
+ Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’, use the list level
+ -
+buttons, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+ Numerical bullet
+LIST OF TOPICS
+2
+Introduction to Trading
+IMCity  
+challenge
+CME Exchange & API
+Rules, Scoring & Prices
+Q&A 
+01
+02
+03
+04
+05Chapter slide [GRADIENT]
+01
+INTRODUCTION TO 
+TRADINGWHO WE ARE
+GLOBAL TRADING POWERED 
+BY QUANT RESEARCH AND TECH
+4WHAT WE DO
+CHAMPION THE BEST IDEAS
+At IMC, we hire, develop, and empower exceptional people. We put the most disruptive 
+technologies like AI, machine learning, and large
+ -
+ scale computing into their hands, so 
+they can help solve the most complex challenges in the market.
+5Introduction to trading
+6
+IMC
+Text 100%
+Using text levels
+1
+Hom
+e
+ Text level up
+Text level down
+Title
+2 ⚬
+Bullet
+3 ￭
+ Sub
+ -
+bullet
+4
+ Default text
+5 Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’
+, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’
+, use the list level-
+buttons
+, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+Numerical bullet
+INTRO TO TRADING
+A  
+ market  
+ maker  
+ is  
+ an  
+ entity  
+ that  
+ quotes  
+ both  
+ a  
+ buy  
+ and  
+ a  
+ sell  
+ price  
+ in 
+ a  
+ financial  
+instrument  
+or  
+commodity,  
+hoping  
+to  
+make  
+a  
+profit  
+on  
+the  
+bid
+ -
+ ask  
+spread
+ .
+It  
+stands  
+ready  
+to  
+buy  
+and  
+sell  
+a  
+financial  
+product  
+on  
+a  
+regular  
+and  
+continuous  
+basis
+ .
+7
+What is a Market Maker?IMC
+Text 100%
+Using text levels
+1
+Hom
+e
+ Text level up
+Text level down
+Title
+2 ⚬
+Bullet
+3 ￭
+ Sub
+ -
+bullet
+4
+ Default text
+5 Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’
+, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’
+, use the list level-
+buttons
+, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+Numerical bullet
+EXAMPLE: 
+An iPhone thrift shop holder
+•
+ Product = iPhone 11 (old model)
+8
+INTRO TO TRADING
+What is a Market Maker?IMC
+Text 100%
+Using text levels
+1
+Hom
+e
+ Text level up
+Text level down
+Title
+2 ⚬
+Bullet
+3 ￭
+ Sub
+ -
+bullet
+4
+ Default text
+5 Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’
+, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’
+, use the list level-
+buttons
+, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+Numerical bullet
+EXAMPLE 1: 
+An iPhone thrift shop holder
+•
+ You run a shop that buys and sells 
+iPhone 11’s
+•
+ You run a model that values them 
+at each moment in time
+•
+ Hence you know for what price 
+you are willing to buy them for 
+(bid) 
+ and you are willing to sell 
+them for 
+ (ask)
+BID-ASK 
+SPREAD
+200 @ 250
+BID ASK
+<
+ >
+9
+INTRO TO TRADING
+What is a Market Maker?IMC
+Text 100%
+Using text levels
+1
+Hom
+e
+ Text level up
+Text level down
+Title
+2 ⚬
+Bullet
+3 ￭
+ Sub
+ -
+bullet
+4
+ Default text
+5 Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’
+, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’
+, use the list level-
+buttons
+, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+Numerical bullet
+10
+Hmm, I could 
+buy a phone 
+for EUR 250!
+I can sell 
+for 250!
+200 @ 250
+Hmm, I 
+could sell 
+my phone 
+for EUR 200
+I can buy 
+for 200!
+Customer 2:
+Customer 1:
+INTRO TO TRADING
+What is a Market Maker?IMC
+Text 100%
+Using text levels
+1
+Hom
+e
+ Text level up
+Text level down
+Title
+2 ⚬
+Bullet
+3 ￭
+ Sub
+ -
+bullet
+4
+ Default text
+5 Subtitle
+Want to know more?
+Go to the slide named ‘Instruction slide: 
+YouTube links’
+, open it in the slideshow 
+and click on the preferred hyperlink.
+Under the tab ‘Home’
+, use the list level-
+buttons
+, as pictured above, to choose a text 
+level.
+Choose from:
+6
+ 1.
+Numerical bullet
+11
+I can buy 
+for 200!
+INTRO TO TRADING
+What is a Market Maker?
+Chapter slide [GRADIENT]
+02
+IMCITY CHALLENGE13Trading London
+14
+Trade the Pulse of the City
+Forget backtests and static datasets.
+In the IMCity London Challenge, you’ll be trading real-world signals in real time
+not simulations, not hypotheticals:
+LONDON ETF:
+Thames water level, trade intraday water activity
+London Heathrow airport activity, surging and dipping through the day.
+London Weather data, influencing energy and movement.
+No pre-programmed datasets.
+No artificial market feeds.
+No design that always know tomorrow.
+Each data point is a heartbeat of the city; every fluctuation is an opportunity. Settlement price is 
+unknown. For now.
+Can your model keep up with reality?Trading London
+15
+Watch London’s data come alive
+Thames levels, temperature, and flight arrivals 
+updating in real time.
+See metrics shift intraday, and track your 
+position on the leaderboard  as markets react.
+Every fluctuation moves prices; every trade 
+changes the ranking.
+Chapter slide [GRADIENT]
+03
+CMI EXCHANGE & APITrading London
+17
+We built our own trading exchange, modelled after real markets.
+You’ll see live order books, bid–ask spreads, and market depth, all driven by London’s data.
+Trade directly through the web interface, or connect your algorithms via our API to stream data, 
+send orders, and manage positions.
+This design is mimicking full-scale electronic trading. You’ll be coding, debugging, optimizing, 
+just like you would on a real trading desk at IMC Trading.
+Your logic! Your algo’s! Your edge?CMI & API
+•
+ Shows order prices at which market 
+participants are willing to buy (bid) or sell (ask)
+•
+ Orders express believes about a tradable 
+quantity: buy 
+ -
+> too low, sell 
+ -
+> too high
+•
+ A new order that crosses resting orders in the 
+book gets executed at the best possible price for 
+the aggressor → 
+Price/Time priority
+•
+ When a new order crosses existing ones, it is 
+   
+ 
+ immediately executed
+18
+WANT TO BUY?
+You click on the left end, 
+on the 
+ green  
+cells at the 
+price you want to buy 
+for
+WANT TO SELL?
+You click on the right 
+end, on the 
+ red  
+cells at 
+the price you want to 
+sell for
+CMI Web GUITrading Styles
+20
+•
+ Market making
+•
+ Arbitraging between correlated markets
+•
+ Trading an alpha signal
+•
+ More??
+CMI API
+•
+ Easy to use Python (>= 3.11) wrappers
+•
+ We have tutorials and templates 
+available to get you started quickly
+•
+ Feel free to write your own code in any 
+language to interact with the API.Chapter slide [GRADIENT]
+04
+RULES, SCORING & 
+PRICESMarkets
+23
+Thames
+1.
+ Absolute value of tidal height in MAOD * 1000 on Sunday at 12:00 PM (so 
+ -
+1,48m will settle to 1480)
+2.
+ Sum of strangle (0.2
+ -
+ 0.25 strikes) values on 15m value differences (t
+ -
+1 vs t) over the past 24 hours *100
+Weather
+3. 
+ Temperature (In Fahrenheit) * Humidity on Sunday at 12:00 PM
+4. 
+ The sums of (Temperature * Humidity) / 100 for all 15
+ -
+ minute time intervals. 
+Airplane
+5. 
+ Number of arrivals and departures on LHR airport in the past 24 hours on Sunday 12:00 PM
+6. 
+ The airport metric: sum over all 30 min intervals : 100 * (arrivals 
+ -  
+departures)/(arrivals + departures)
+London ETF
+7. 
+ ETF spot price: Market 1 + Market 3 + Market 5 at settlement
+8.  
+ Option structure on the ETF: +2 P6200
+ +C6200  
+ -
+2 C6600 +3 C7000
+Markets will be run based on data from Saturday 12:00 PM until Sunday 12:00 PMMarkets
+24
+Thames
+•
+ Water level
+Markets
+1.
+ ABS(Water level) on (Sunday at 12:00) in 
+ Metres  
+Above Ordnance Datum (MAOD) * 1000 
+ 
+E.g.   
+Settlement would be: ABS(
+ -
+1,41) * 1000 = 
+ -
+1410
+https://
+ environment.data.gov.uk
+ /flood
+ -
+monitoring/id/measures/0006
+ -
+level
+ -
+tidal_level
+ -
+i
+-
+15_min
+ -
+mAOD/readings
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00
+20.11.2025 12:00 -1,41
+20.11.2025 11:45 -1,42
+20.11.2025 11:30 -1,43
+20.11.2025 11:15 -1,2325
+Markets
+26
+Thames
+•
+ Water level
+Markets
+  
+2.  Sum of strangle (0.2
+ -
+ 0.25 STRIKES) values on 15m value differences (t
+ -
+1 vs t) over the past 24 hours *100
+E.g. 
+  
+   
+Water level values (MAOD)           
+ Strangle value computation
+ 
+ 
+In this case, the sum of these straddle values is (0 + 0.11 + 0.08 + ….) * 100 = settlement value
+https://
+ environment.data.gov.uk
+ /flood
+ -
+monitoring/id/measures/0006
+ -
+level
+ -
+tidal_level
+ -
+i
+-
+15_min
+ -
+mAOD/readings
+Markets will run from Saturday 12:00 until Sunday 12:00
+20.11.2025 12:00 1,31
+20.11.2025 11:45 1,52
+20.11.2025 11:30 1,43
+20.11.2025 11:15 1,1
+20.11.2025 10:00 Diff= 0.21 → strangle = 0
+20.11.2025 09:00 Diff = 0.09, strangle = 0.11
+20.11.2025 08:00 Diff =0.33, strangle = 0.08  
+20.11.2025 07:00 …Markets
+27
+London Weather data
+•
+ Temperature (Fahrenheit)
+•
+ Humidity
+Markets
+3. 
+ Temperature (Fahrenheit, rounded) * humidity at time of settlement
+ 
+E.g.   
+Settlement would be:  33*29 = 957
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement 
+Date Temperature Humidtiy T*H
+20.11.2025 12:00 33 29 957
+20.11.2025 11:45 30 30 900
+20.11.2025 11:30 30 90 2700Markets
+28
+London Weather data
+•
+ Temperature (Fahrenheit)
+•
+ Humidity
+Markets
+4. • The sums of (Temperature *Humidity) / 100 over all 115m time intervals. 
+  
+settlement would be: 957 + 900 + 2700 + .... 
+ = 4557 + …
+https://api.open
+ -
+ meteo.com/v1/forecast
+ , (LAT, LON) = (51.5074, 
+ -
+ 0.1278)
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement 
+Date Temperature Humidtiy T*H
+20.11.2025 12:00 33 29 957
+20.11.2025 11:45 30 30 900
+20.11.2025 11:30 30 90 2700Markets
+29
+Airport
+•
+ Arrivals to LHR Airport  
+•
+ Departures from LHR Airport
+Markets
+5.
+ Number of (incoming flights + number of outgoing flights) over the 24h time period
+   
+E.g. Settlement would be: ((13+10+15+…)+(9+19+11+…)) = (38+..) + (39+…)
+https://aerodatabox.p.rapidapi.com/flights/airports/iata
+ /
+LHR
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement 
+Date Arrivals Departures
+20.11.2025 11:30-11:59 13 9
+20.11.2025 11:00-11:29 10 19
+20.11.2025 10:30-10:59 15 11Markets
+30
+Airport
+•
+ Arrivals to LHR Airport  
+•
+ Departures from LHR Airport
+Markets
+6. The airport metric: 
+ sum over the intervals : 100 * ((arrivals 
+ -  
+departures))/(max(arrivals + departures, 1))), settles 
+to the absolute value E.g.
+ 
+09:30
+ -
+ 09:59 metric: 100 * ((13
+ -
+9))/((13+9)) = 18.18
+ 
+settlement would be: 18.18 
+ – 
+31.03 + 15.38 + ….. = |2.52+….| 
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement 
+Date Arrivals Departures Metric
+20.11.2025 09:30-09:59 13 9 18.18
+20.11.2025 09:00-09:29 10 19 -31.03
+20.11.2025 08:30-08:59 15 11 15.38Markets
+31
+ETF
+•
+ Spot value, combining previous markets. Settles to absolute value, so ETF settlement can not be negative
+Markets
+7.
+ ETF constituents:  
+•
+ Market 1 (settlement value)
+•
+ Market 3 (settlement value)
+•
+ Market 5 (settlement value)
+ 
+E.g. if we have a water level = 1000, Temperature * Humidity = 1500 and number of flights = 500
+The ETF will settle to: 1000+1500+500 = 3000
+  
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement Markets
+32
+ETF
+•
+ Combining previous markets
+Markets
+8. 
+ Option package (A, B, C & D) on the ETF settlement value
+A) Long 2 6200 Strike Puts &
+B) Long 1 6200 Strike Call &
+C) Short 2 6600 Strike Calls &
+D) Long 3 7000 Strike Calls
+-
+ If the final settlement of the ETF is 6300, market 8 settles to:
+A)
+ 2* Max(0,6200
+ -
+ 6300) = 0 
+B)
+ 1 * Max(0, 6300
+ -
+ 6200) = 100
+C)
+ -
+2 * Max(0,6300
+ -
+ 6600) = 0
+D)
+ 3 * Max(0, 6300
+ -
+7000) = 0
+ 
+ 
+ The payoff of the {K} strike put for settlement value {S} is: max(0, K
+ -
+S).                The payoff of the {K} strike call for 
+ settlement value {S} is: max(0, S
+ -
+ K)
+The payoff of the {x} strike put for settlement value {y} is: max(0, x
+ -
+y)
+The payoff of the {x} strike call for settlement value {y} is: max(0, y
+ -
+x)
+the payoff of a 80 strike put is: max(0,80
+ -
+y)
+The payoff of a 100 strike call is: max(0,y
+ -
+100)
+If the ETF settlement value is |18.5| the strangle settles to max(0,80
+ -
+18.5)+max(0,18.5
+ -
+100) = 61.5
+https://www.hnd.bayern.de/pegel/isar/muenchen
+ -
+ himmelreichbruecke
+ -
+16515005/tabelle
+Markets will run from Saturday 12:00 until Sunday 12:00, only that period will be used for settlement 
+Rules
+33
+1.
+ • Do not manipulate or interfere with other teams’ bots or the exchange. 
+   
+ Don't try to break things!
+2.
+ • No collusion or coordinated trading between teams
+3.
+ • Keep API usage efficient 
+ — 
+don’t hammer endpoints
+4.
+ • Don’t spawn excessive connections or threads
+5.
+ • Stay within your team’s position limits (
+ ±
+100 net long or short 
+ per product)
+6.
+ • Be curious, collaborative, and competitive 
+ — 
+but keep the system running for everyone
+Failure to oblique results in a permanent ban. If you are unsure if something is allowed or not, 
+please just ask the IMC Staff (: Points
+35
+1.
+ We will settle all products at the end of the trading round. For each 
+ productGroup  
+where you have 
+positive 
+ PnL
+ , we normalize your 
+ PnL  
+by the sum of all positive 
+ PnLs  
+across teams in that product.
+2.
+ This makes each product’s group’ score a percentage share of the achievable 
+ PnL
+ .
+3.
+ Teams with losses will see their score be normalized against all other teams with negative 
+ PnL
+ , We 
+have 5 product Groups: 
+       
+ A) Market 1,3,5 & 7, B) Market 2, C) Market 4, D) Market 6, E) Market 8
+Product Group A points will be multiplied by 4 (Given we have 4 products in there)
+4.
+ Your final total score is the sum of all product scores, which is derived from the obtained 
+ PnL  
+based 
+on your trading. Any leftover position is sold/bought by our system at the settlement price.
+E.g. PNL A: Market 1, 3, 5 & 7 B: Market 2 C: Market 4 D: Market 6 E: Market 8
+Team A -90 27 171 80 117
+Team B -52 130 138 0 147
+Team C 54 50 6 20 195
+Team D 145 65 30 -100 -43
+Team E -89 171 161 0 94
+POINTS
+A: Market 1 B: Market 2 C: Market 4 D: Market 6 E: Market 8 Total Score
+Team A
+-0,39 0,061 0,338 0,8 0,212 -0.149
+Team B
+-0,225 0,293 0,273 0 0,266 -0,068
+Team C
+0,271 0,113 0,012 0,2 0,353 1,762
+Team D
+0,729 0,147 0,059 -1 -1 1.122
+Team E
+-0,385 0,386 0,318 0 0,17 -0.66Chapter slide [GRADIENT]
+05
+Q&A•  Any questions?
+•  Happy coding!
+• Please scan the code on the right to register  →
+ You can not participate in the challenge without this registration!
+37
+

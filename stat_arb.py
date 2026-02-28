@@ -18,11 +18,23 @@ enforces the ±100 hard position limit as a final safety net on every order.
 
 import threading
 import time
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Dict, Any, List
 
 import numpy as np
 
 from imc_template.bot_template import OrderRequest, Side
+
+@dataclass(frozen=True)
+class BBO:
+    mid: float
+    best_bid: Optional[float]
+    best_ask: Optional[float]
+
+@dataclass(frozen=True)
+class BasketLeg:
+    product: str
+    weight: int = 1
 
 # ── MC cache constants ────────────────────────────────────────────────────────
 _MC_CACHE_TTL      = 1.0   # seconds before recomputing fair value
@@ -146,6 +158,50 @@ def mc_delta(
     return float(np.mean((up - dn) / (2.0 * bump)))
 
 
+def solve_sigma_impl_bisect(
+    mu: float,
+    target_price: float,
+    *,
+    sigma_lo: float = 1e-6,
+    sigma_hi: float = 2500.0,
+    tol_price: float = 1.0,
+    max_iter: int = 22,
+    mc_sims: int = 35_000,
+    rng: Optional[np.random.Generator] = None,
+) -> float:
+    """
+    Solve for sigma so that MC_fair_value(mu, sigma) ~ target_price using bisection.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if target_price <= 0:
+        return float(sigma_lo)
+
+    f_lo = mc_fair_value(etf_option_package_payoff, mu, sigma_lo, n_sims=mc_sims, rng=rng)
+    f_hi = mc_fair_value(etf_option_package_payoff, mu, sigma_hi, n_sims=mc_sims, rng=rng)
+
+    if target_price <= f_lo:
+        return float(sigma_lo)
+    if target_price >= f_hi:
+        return float(sigma_hi)
+
+    lo, hi = float(sigma_lo), float(sigma_hi)
+    for _ in range(int(max_iter)):
+        mid = 0.5 * (lo + hi)
+        f_mid = mc_fair_value(etf_option_package_payoff, mu, mid, n_sims=mc_sims, rng=rng)
+
+        if abs(f_mid - target_price) <= tol_price:
+            return float(mid)
+
+        if f_mid < target_price:
+            lo = mid
+        else:
+            hi = mid
+
+    return float(0.5 * (lo + hi))
+
+
 # ---------------------------------------------------------------------------
 # Exchange adapter — bridges arb strategies to IMCBot
 # ---------------------------------------------------------------------------
@@ -167,11 +223,25 @@ class BotExchangeAdapter:
         self._bot  = bot
         self._lock = threading.Lock()
         self._mids: dict[str, float] = {}
+        self._bbos: dict[str, BBO] = {}
+
+    def update_bbo(self, product: str, bbo: BBO) -> None:
+        """Store the current BBO for a product (called on every tick by main.py)."""
+        with self._lock:
+            self._mids[product] = bbo.mid
+            self._bbos[product] = bbo
+
+    def get_best_bid_ask(self, product: str) -> BBO:
+        """Return the BBO, or nan if never seen."""
+        with self._lock:
+            return self._bbos.get(product, BBO(float("nan"), None, None))
 
     def update_mid(self, product: str, mid: float) -> None:
-        """Store the current mid price for a product (called on every tick)."""
+        """Store the current mid price for a product (fallback)."""
         with self._lock:
             self._mids[product] = mid
+            if product not in self._bbos:
+                self._bbos[product] = BBO(mid, None, None)
 
     def get_mid(self, product: str) -> float:
         """Return the last known mid price, or NaN if never seen."""
@@ -339,167 +409,292 @@ class VolatileOptionArb:
 
 
 # ---------------------------------------------------------------------------
-# Strategy B: ETFPackageArb — LON_ETF vs LON_FLY Monte Carlo pricer
+# Strategy B: ETFBasketArb — LON_ETF vs (TIDE_SPOT + WX_SPOT + LHR_COUNT)
 # ---------------------------------------------------------------------------
 
-class ETFPackageArb:
-    """Model-based arb between LON_ETF (Market 7) and LON_FLY (Market 8).
+class ETFBasketArb:
+    """Classic identity arbitrage for IMCity (Market 7).
 
-    Algorithm:
-      1. Track ETF mid via EWMA (mu) and rolling std (sigma).
-      2. Price LON_FLY fair value = MC E[payoff(ETF_settlement)] under
-         ETF_settlement ~ N(mu, sigma).  Results are cached for 1 second
-         to avoid running 45k sims on every SSE tick.
-      3. Trade LON_FLY when |market_mid − fair| > edge.
-      4. Delta-hedge with LON_ETF: when selling LON_FLY, buy Δ units of
-         LON_ETF (and vice versa).  Delta is computed via MC finite difference
-         only when a trade fires (not on every tick).
-
-    Delta sign analysis by ETF level:
-        S < 6200  : delta ≈ −2  (puts dominate — short delta)
-        6200–6600 : delta ≈ +1  (long call)
-        6600–7000 : delta ≈ −1  (short call region)
-        S > 7000  : delta ≈ +2  (three calls)
-    The hedge direction therefore flips in the 6600–7000 range — the code
-    handles this correctly via `hedge_qty` sign.
-
-    Args:
-        api:         BotExchangeAdapter instance.
-        etf:         CMI symbol for LON_ETF.
-        pack:        CMI symbol for LON_FLY.
-        model_alpha: EWMA alpha for ETF fair-value tracking.
-        edge:        Min mispricing (price units) before trading LON_FLY.
-        max_pos:     Strategy-level position cap for LON_FLY.
-        clip:        Max LON_FLY contracts per order.
-        hedge_clip:  Max LON_ETF contracts per hedge.
-        mc_sims:     Sims for fair-value calculation (uses antithetic variates).
-        delta_sims:  Sims for delta calculation (only on trade events).
+    Market 7 (LON_ETF) settles to Market 1 + Market 3 + Market 5.
+    Trades deviations between the ETF and the live basket value.
     """
 
     def __init__(
         self,
-        api:          BotExchangeAdapter,
-        etf:          str   = "LON_ETF",
-        pack:         str   = "LON_FLY",
-        model_alpha:  float = 0.05,
-        edge:         float = 12.0,
-        max_pos:      int   = 40,
-        clip:         int   = 6,
-        hedge_clip:   int   = 12,
-        mc_sims:      int   = 45_000,
-        delta_sims:   int   = 25_000,
-    ):
-        self.api        = api
-        self.etf        = etf
-        self.pack       = pack
-        self.edge       = edge
-        self.max_pos    = min(max_pos, BotExchangeAdapter.HARD_LIMIT)
-        self.clip       = clip
-        self.hedge_clip = hedge_clip
-        self.mc_sims    = mc_sims
-        self.delta_sims = delta_sims
-        self.rng        = np.random.default_rng(7)
+        api: BotExchangeAdapter,
+        *,
+        etf: str = "LON_ETF",
+        legs: Optional[List[BasketLeg]] = None,
+        edge: float = 12.0,
+        max_pos_etf: int = 60,
+        max_pos_leg: int = 60,
+        clip: int = 6,
+        leg_clip: int = 6,
+        cooldown: float = 0.30,
+        price_mode: str = "CROSS",
+    ) -> None:
+        self.api = api
+        self.etf = etf
+        self.legs = legs or [
+            BasketLeg("TIDE_SPOT"),
+            BasketLeg("WX_SPOT"),
+            BasketLeg("LHR_COUNT"),
+        ]
+        self.edge = float(edge)
+        self.max_pos_etf = min(int(max_pos_etf), api.HARD_LIMIT)
+        self.max_pos_leg = min(int(max_pos_leg), api.HARD_LIMIT)
+        self.clip = int(clip)
+        self.leg_clip = int(leg_clip)
+        self.cooldown = float(cooldown)
+        self.price_mode = price_mode.upper()
+        if self.price_mode not in ("MID", "CROSS"):
+            raise ValueError("price_mode must be MID or CROSS")
+        self._last_t = 0.0
 
-        self.etf_model   = EWMA(alpha=model_alpha)
-        self.etf_rolling = Rolling(n=120)
+    def _mid_or_cross_price(self, product: str, side: str) -> float:
+        bbo = self.api.get_best_bid_ask(product)
+        if self.price_mode == "MID":
+            return bbo.mid
+        side_u = side.upper()
+        if side_u == "BUY":
+            return float(bbo.best_ask) if bbo.best_ask is not None else bbo.mid
+        else:
+            return float(bbo.best_bid) if bbo.best_bid is not None else bbo.mid
 
-        # MC fair-value cache
-        self._cache_mu:    Optional[float] = None
-        self._cache_sigma: Optional[float] = None
-        self._cache_fair:  Optional[float] = None
-        self._cache_time:  float           = 0.0
+    def _basket_value(self) -> float:
+        total = 0.0
+        for leg in self.legs:
+            mid = self.api.get_mid(leg.product)
+            if np.isnan(mid):
+                return float("nan")
+            total += leg.weight * mid
+        return float(total)
 
-    def _get_cached_fair(self, mu: float, sigma: float) -> float:
-        """Return MC fair value from cache; recompute only when stale or inputs shifted."""
-        now       = time.monotonic()
-        stale     = (now - self._cache_time) > _MC_CACHE_TTL
-        mu_moved  = self._cache_mu    is None or abs(mu    - self._cache_mu)    > _MC_CACHE_MID_TOL
-        sig_moved = self._cache_sigma is None or abs(sigma - self._cache_sigma) > 1.0
+    def _room(self, product: str, cap: int) -> tuple[int, int, int]:
+        pos = self.api.get_position(product)
+        return pos, max(0, cap - pos), max(0, cap + pos)
 
-        if stale or mu_moved or sig_moved:
-            self._cache_fair  = mc_fair_value(
-                etf_option_package_payoff, mu, sigma,
-                n_sims=self.mc_sims, rng=self.rng,
-            )
-            self._cache_mu    = mu
-            self._cache_sigma = sigma
-            self._cache_time  = now
+    def step(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        if now - self._last_t < self.cooldown:
+            return {"action": "COOLDOWN"}
 
-        return self._cache_fair  # type: ignore[return-value]
+        etf_mid = self.api.get_mid(self.etf)
+        basket_mid = self._basket_value()
+        if np.isnan(etf_mid) or np.isnan(basket_mid):
+            return {"action": "NO_DATA"}
 
-    def step(
+        spread = float(etf_mid - basket_mid)
+        etf_pos, etf_room_buy, etf_room_sell = self._room(self.etf, self.max_pos_etf)
+
+        act = "HOLD"
+
+        if spread > self.edge and etf_room_sell > 0:
+            qty_etf = int(min(self.clip, etf_room_sell))
+
+            q_caps = []
+            for leg in self.legs:
+                _, leg_room_buy, _ = self._room(leg.product, self.max_pos_leg)
+                q_caps.append(int(min(self.leg_clip, leg_room_buy)))
+
+            qty = int(min([qty_etf] + q_caps))
+            if qty <= 0:
+                return {"etf_mid": etf_mid, "basket_mid": basket_mid, "spread": spread, "action": "CAPPED"}
+
+            ok = True
+            for leg in self.legs:
+                px = self._mid_or_cross_price(leg.product, "BUY")
+                ok &= self.api.place_order(leg.product, "BUY", px, qty * abs(leg.weight))
+
+            px_etf = self._mid_or_cross_price(self.etf, "SELL")
+            ok &= self.api.place_order(self.etf, "SELL", px_etf, qty)
+
+            if ok:
+                self._last_t = now
+                act = f"SELL_ETF {qty} / BUY_BASKET {qty}"
+
+        elif spread < -self.edge and etf_room_buy > 0:
+            qty_etf = int(min(self.clip, etf_room_buy))
+
+            q_caps = []
+            for leg in self.legs:
+                _, _, leg_room_sell = self._room(leg.product, self.max_pos_leg)
+                q_caps.append(int(min(self.leg_clip, leg_room_sell)))
+
+            qty = int(min([qty_etf] + q_caps))
+            if qty <= 0:
+                return {"etf_mid": etf_mid, "basket_mid": basket_mid, "spread": spread, "action": "CAPPED"}
+
+            ok = True
+            px_etf = self._mid_or_cross_price(self.etf, "BUY")
+            ok &= self.api.place_order(self.etf, "BUY", px_etf, qty)
+
+            for leg in self.legs:
+                px = self._mid_or_cross_price(leg.product, "SELL")
+                ok &= self.api.place_order(leg.product, "SELL", px, qty * abs(leg.weight))
+
+            if ok:
+                self._last_t = now
+                act = f"BUY_ETF {qty} / SELL_BASKET {qty}"
+
+        return {
+            "etf_mid": etf_mid, "basket_mid": basket_mid, "spread": spread,
+            "etf_pos": etf_pos, "action": act,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy C: ETFPackageImpliedVolArb — LON_FLY Implied Vol arb
+# ---------------------------------------------------------------------------
+
+class ETFPackageImpliedVolArb:
+    """Market 8 implied-vol arb for IMCity."""
+    
+    def __init__(
         self,
-        etf_mid:  Optional[float] = None,
-        pack_mid: Optional[float] = None,
-    ) -> dict:
-        """Evaluate and potentially trade the ETF / package spread.
+        api: BotExchangeAdapter,
+        *,
+        etf: str = "LON_ETF",
+        pack: str = "LON_FLY",
+        model_alpha: float = 0.05,
+        window: int = 120,
+        vol_edge: float = 40.0,
+        max_pos: int = 40,
+        clip: int = 6,
+        hedge_clip: int = 12,
+        iv_mc_sims: int = 35_000,
+        delta_sims: int = 25_000,
+        bump: float = 1.0,
+        cooldown: float = 0.35,
+        price_mode: str = "CROSS",
+    ) -> None:
+        self.api = api
+        self.etf = etf
+        self.pack = pack
 
-        Args:
-            etf_mid:  Current LON_ETF mid.  Falls back to adapter cache.
-            pack_mid: Current LON_FLY mid.  Falls back to adapter cache.
+        self.mu_model = EWMA(alpha=model_alpha)
+        self.etf_rolling = Rolling(n=window)
 
-        Returns:
-            Status dict with keys: etf_mid, mu, sigma, pack_mid, fair, mis,
-            pack_pos, action.
-        """
-        if etf_mid  is None:
-            etf_mid  = self.api.get_mid(self.etf)
-        if pack_mid is None:
-            pack_mid = self.api.get_mid(self.pack)
+        self.vol_edge = float(vol_edge)
+        self.max_pos = min(int(max_pos), api.HARD_LIMIT)
+        self.clip = int(clip)
+        self.hedge_clip = int(hedge_clip)
 
+        self.iv_mc_sims = int(iv_mc_sims)
+        self.delta_sims = int(delta_sims)
+        self.bump = float(bump)
+
+        self.cooldown = float(cooldown)
+        self.price_mode = price_mode.upper()
+        if self.price_mode not in ("MID", "CROSS"):
+            raise ValueError("price_mode must be MID or CROSS")
+
+        self.rng = np.random.default_rng(11)
+
+        self._iv_cache_time = 0.0
+        self._iv_cache_mu: Optional[float] = None
+        self._iv_cache_pack: Optional[float] = None
+        self._iv_cache_sigma: Optional[float] = None
+        self._iv_ttl = 1.0
+        self._mu_tol = 1.0
+        self._pack_tol = 1.0
+
+        self._last_t = 0.0
+
+    def _price(self, product: str, side: str) -> float:
+        bbo = self.api.get_best_bid_ask(product)
+        if self.price_mode == "MID":
+            return bbo.mid
+        side_u = side.upper()
+        if side_u == "BUY":
+            return float(bbo.best_ask) if bbo.best_ask is not None else bbo.mid
+        return float(bbo.best_bid) if bbo.best_bid is not None else bbo.mid
+
+    def _sigma_impl_cached(self, mu: float, pack_mid: float) -> float:
+        now = time.monotonic()
+        stale = (now - self._iv_cache_time) > self._iv_ttl
+        mu_moved = self._iv_cache_mu is None or abs(mu - self._iv_cache_mu) > self._mu_tol
+        pack_moved = self._iv_cache_pack is None or abs(pack_mid - self._iv_cache_pack) > self._pack_tol
+
+        if stale or mu_moved or pack_moved:
+            sig = solve_sigma_impl_bisect(
+                mu=mu,
+                target_price=pack_mid,
+                tol_price=1.2,
+                mc_sims=self.iv_mc_sims,
+                rng=self.rng,
+            )
+            self._iv_cache_mu = float(mu)
+            self._iv_cache_pack = float(pack_mid)
+            self._iv_cache_sigma = float(sig)
+            self._iv_cache_time = now
+
+        return float(self._iv_cache_sigma)
+
+    def step(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        if now - self._last_t < self.cooldown:
+            return {"action": "COOLDOWN"}
+
+        etf_mid = self.api.get_mid(self.etf)
+        pack_mid = self.api.get_mid(self.pack)
         if np.isnan(etf_mid) or np.isnan(pack_mid):
             return {"action": "NO_DATA"}
 
-        mu = self.etf_model.update(etf_mid)
+        mu = self.mu_model.update(etf_mid)
         self.etf_rolling.add(etf_mid)
 
         if not self.etf_rolling.ready():
-            return {
-                "etf_mid": etf_mid, "pack_mid": pack_mid,
-                "fair": float("nan"), "mis": float("nan"), "action": "WARMUP",
-            }
+            return {"etf_mid": etf_mid, "pack_mid": pack_mid, "action": "WARMUP"}
 
-        sigma = self.etf_rolling.std()
-        if np.isnan(sigma) or sigma < 1e-6:
-            return {
-                "etf_mid": etf_mid, "pack_mid": pack_mid,
-                "fair": float("nan"), "mis": float("nan"), "action": "NO_VOL",
-            }
+        sigma_est = self.etf_rolling.std()
+        if np.isnan(sigma_est) or sigma_est < 1e-6:
+            return {"etf_mid": etf_mid, "pack_mid": pack_mid, "action": "NO_VOL"}
 
-        fair     = self._get_cached_fair(mu, sigma)
-        mis      = pack_mid - fair
+        sigma_impl = self._sigma_impl_cached(mu, pack_mid)
+        vol_spread = float(sigma_impl - sigma_est)
+
         pack_pos = self.api.get_position(self.pack)
-        room_buy  = max(0, self.max_pos - pack_pos)
+        room_buy = max(0, self.max_pos - pack_pos)
         room_sell = max(0, self.max_pos + pack_pos)
 
         act = "HOLD"
 
-        if mis > self.edge and room_sell > 0:
+        if vol_spread > self.vol_edge and room_sell > 0:
             qty = int(min(self.clip, room_sell))
-            if self.api.place_order(self.pack, "SELL", pack_mid, qty):
-                delta     = mc_delta(etf_option_package_payoff, mu, sigma,
-                                     n_sims=self.delta_sims, rng=self.rng)
+            px_pack = self._price(self.pack, "SELL")
+            if self.api.place_order(self.pack, "SELL", px_pack, qty):
+                delta = mc_delta(etf_option_package_payoff, mu, sigma_est, bump=self.bump, n_sims=self.delta_sims, rng=self.rng)
                 hedge_qty = int(np.clip(round(delta * qty), -self.hedge_clip, self.hedge_clip))
                 if hedge_qty > 0:
-                    self.api.place_order(self.etf, "BUY",  etf_mid,  hedge_qty)
+                    self.api.place_order(self.etf, "BUY", self._price(self.etf, "BUY"), hedge_qty)
                 elif hedge_qty < 0:
-                    self.api.place_order(self.etf, "SELL", etf_mid, -hedge_qty)
-                act = f"SELL_PACK {qty} + HEDGE_ETF {hedge_qty:+d}"
+                    self.api.place_order(self.etf, "SELL", self._price(self.etf, "SELL"), -hedge_qty)
 
-        elif mis < -self.edge and room_buy > 0:
+                self._last_t = now
+                act = f"SELL_PACK {qty} / IV_RICH {vol_spread:+.1f} / HEDGE_ETF {hedge_qty:+d}"
+
+        elif vol_spread < -self.vol_edge and room_buy > 0:
             qty = int(min(self.clip, room_buy))
-            if self.api.place_order(self.pack, "BUY", pack_mid, qty):
-                delta     = mc_delta(etf_option_package_payoff, mu, sigma,
-                                     n_sims=self.delta_sims, rng=self.rng)
+            px_pack = self._price(self.pack, "BUY")
+            if self.api.place_order(self.pack, "BUY", px_pack, qty):
+                delta = mc_delta(etf_option_package_payoff, mu, sigma_est, bump=self.bump, n_sims=self.delta_sims, rng=self.rng)
                 hedge_qty = int(np.clip(round(delta * qty), -self.hedge_clip, self.hedge_clip))
                 if hedge_qty > 0:
-                    self.api.place_order(self.etf, "SELL", etf_mid,  hedge_qty)
+                    self.api.place_order(self.etf, "SELL", self._price(self.etf, "SELL"), hedge_qty)
                 elif hedge_qty < 0:
-                    self.api.place_order(self.etf, "BUY",  etf_mid, -hedge_qty)
-                act = f"BUY_PACK {qty} + HEDGE_ETF {-hedge_qty:+d}"
+                    self.api.place_order(self.etf, "BUY", self._price(self.etf, "BUY"), -hedge_qty)
+
+                self._last_t = now
+                act = f"BUY_PACK {qty} / IV_CHEAP {vol_spread:+.1f} / HEDGE_ETF {-hedge_qty:+d}"
 
         return {
-            "etf_mid": etf_mid, "mu": mu, "sigma": sigma,
-            "pack_mid": pack_mid, "fair": fair, "mis": mis,
-            "pack_pos": pack_pos, "action": act,
+            "etf_mid": etf_mid,
+            "mu": mu,
+            "sigma_est": sigma_est,
+            "pack_mid": pack_mid,
+            "sigma_impl": sigma_impl,
+            "vol_spread": vol_spread,
+            "pack_pos": pack_pos,
+            "action": act,
         }

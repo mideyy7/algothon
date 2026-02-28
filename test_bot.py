@@ -146,22 +146,6 @@ def _make_ready_swing_arb(edge: float = 18.0, vol_block_z: float = 2.8):
     return arb, api
 
 
-def _make_ready_etf_arb(edge: float = 12.0, mc_sims: int = 2_000, delta_sims: int = 500):
-    """ETFPackageArb pre-warmed with 20 oscillating ETF mids (mean=6500, std=50).
-
-    Uses small mc_sims/delta_sims to keep tests fast.
-    """
-    from stat_arb import ETFPackageArb
-    api = MagicMock()
-    api.get_position.return_value = 0
-    api.place_order.return_value = True
-    arb = ETFPackageArb(api=api, edge=edge, mc_sims=mc_sims, delta_sims=delta_sims)
-    for i in range(20):
-        v = 6500.0 + 50.0 * (1 if i % 2 == 0 else -1)
-        arb.step(etf_mid=v, pack_mid=300.0)
-    api.place_order.reset_mock()
-    return arb, api
-
 
 # ── quant_models: predict_tide_spot ───────────────────────────────────────────
 
@@ -508,34 +492,35 @@ class TestOnOrderbook(unittest.TestCase):
             mock_cancel.assert_called_once_with("order-abc-123")
 
 
-# ── IMCBot._compute_mid ───────────────────────────────────────────────────────
+# ── IMCBot._compute_bbo ───────────────────────────────────────────────────────
 
-class TestComputeMid(unittest.TestCase):
+class TestComputeBBO(unittest.TestCase):
 
     def setUp(self):
         from main import IMCBot
-        self.compute_mid = IMCBot._compute_mid
+        self.compute_bbo = IMCBot._compute_bbo
 
-    def test_mid_with_both_sides(self):
+    def test_bbo_with_both_sides(self):
         ob = _make_orderbook(bid=1400.0, ask=1420.0)
-        self.assertAlmostEqual(self.compute_mid(ob), 1410.0)
+        self.assertAlmostEqual(self.compute_bbo(ob).mid, 1410.0)
 
-    def test_mid_bid_only(self):
+    def test_bbo_bid_only(self):
         ob = _make_orderbook_bid_only(bid=1410.0)
-        self.assertAlmostEqual(self.compute_mid(ob), 1410.0)
+        self.assertAlmostEqual(self.compute_bbo(ob).mid, 1410.0)
 
-    def test_mid_ask_only(self):
+    def test_bbo_ask_only(self):
         from imc_template.bot_template import OrderBook, Order
         ob = OrderBook(
             product="TIDE_SPOT", tick_size=1.0,
             buy_orders=[],
             sell_orders=[Order(price=1420.0, volume=10, own_volume=0)],
         )
-        self.assertAlmostEqual(self.compute_mid(ob), 1420.0)
+        self.assertAlmostEqual(self.compute_bbo(ob).mid, 1420.0)
 
-    def test_mid_empty_orderbook_returns_none(self):
+    def test_bbo_empty_orderbook_returns_nan(self):
+        import math
         ob = _make_orderbook_empty()
-        self.assertIsNone(self.compute_mid(ob))
+        self.assertTrue(math.isnan(self.compute_bbo(ob).mid))
 
 
 # ── IMCBot._run_arb dispatcher ────────────────────────────────────────────────
@@ -562,22 +547,13 @@ class TestRunArb(unittest.TestCase):
         mock_swing.assert_not_called()
         mock_etf.assert_not_called()
 
-    def test_lon_etf_dispatches_when_both_mids_available(self):
+    def test_lon_etf_dispatches(self):
         bot = _make_bot()
-        bot._exchange_adapter.update_mid("LON_ETF", 6500.0)
-        bot._exchange_adapter.update_mid("LON_FLY", 300.0)
-        with patch.object(bot._etf_package_arb, "step", return_value={"action": "HOLD"}) as mock_step:
+        with patch.object(bot._etf_package_arb, "step", return_value={"action": "HOLD"}) as mock_pack, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket:
             bot._run_arb("LON_ETF", 6500.0)
-        mock_step.assert_called_once()
-
-    def test_lon_etf_not_dispatched_when_fly_mid_missing(self):
-        """If LON_FLY mid is NaN (not seen yet), ETF arb should be skipped."""
-        bot = _make_bot()
-        bot._exchange_adapter.update_mid("LON_ETF", 6500.0)
-        # LON_FLY mid never set → NaN
-        with patch.object(bot._etf_package_arb, "step") as mock_step:
-            bot._run_arb("LON_ETF", 6500.0)
-        mock_step.assert_not_called()
+        mock_pack.assert_called_once()
+        mock_basket.assert_called_once()
 
 
 # ── Risk framework integration ────────────────────────────────────────────────
@@ -961,70 +937,33 @@ class TestVolatileOptionArb(unittest.TestCase):
                                "Inventory skew should widen effective edge")
 
 
-# ── ETFPackageArb (LON_ETF vs LON_FLY MC pricer) ─────────────────────────────
+# ── ETF Arbitrage Frameworks ─────────────────────────────────────────────────
 
-class TestETFPackageArb(unittest.TestCase):
+class TestNewETFStrategies(unittest.TestCase):
 
-    def test_warmup_before_rolling_ready(self):
-        from stat_arb import ETFPackageArb
+    def test_basket_arb_initialises(self):
+        from stat_arb import ETFBasketArb
         api = MagicMock()
-        api.get_position.return_value = 0
-        arb = ETFPackageArb(api=api, edge=12.0, mc_sims=500, delta_sims=200)
-        for _ in range(5):
-            result = arb.step(etf_mid=6500.0, pack_mid=300.0)
-        self.assertEqual(result["action"], "WARMUP")
+        api.HARD_LIMIT = 100
+        arb = ETFBasketArb(api=api)
+        self.assertIsNotNone(arb)
+        self.assertEqual(len(arb.legs), 3)
 
-    def test_no_vol_when_etf_mids_identical(self):
-        """Constant ETF mids → sigma=0 → NO_VOL."""
-        from stat_arb import ETFPackageArb
+    def test_implied_vol_arb_initialises(self):
+        from stat_arb import ETFPackageImpliedVolArb
         api = MagicMock()
-        api.get_position.return_value = 0
-        arb = ETFPackageArb(api=api, edge=12.0, mc_sims=500, delta_sims=200)
-        for _ in range(20):
-            result = arb.step(etf_mid=6500.0, pack_mid=300.0)
-        self.assertEqual(result["action"], "NO_VOL")
+        api.HARD_LIMIT = 100
+        arb = ETFPackageImpliedVolArb(api=api)
+        self.assertIsNotNone(arb)
 
-    def test_hold_within_edge(self):
-        """Mispricing smaller than edge → HOLD."""
-        arb, api = _make_ready_etf_arb(edge=100.0)   # very large edge
-        with patch.object(arb, "_get_cached_fair", return_value=300.0):
-            result = arb.step(etf_mid=6500.0, pack_mid=305.0)  # mis=5 < 100
-        self.assertEqual(result["action"], "HOLD")
-
-    def test_sell_pack_when_overpriced(self):
-        """pack_mid > fair + edge → SELL_PACK."""
-        arb, api = _make_ready_etf_arb(edge=12.0)
-        with patch.object(arb, "_get_cached_fair", return_value=300.0), \
-             patch("stat_arb.mc_delta", return_value=0.0):
-            result = arb.step(etf_mid=6500.0, pack_mid=320.0)  # mis=20 > 12
-        self.assertTrue(result["action"].startswith("SELL_PACK"),
-                        f"Expected SELL_PACK, got: {result['action']!r}")
-
-    def test_buy_pack_when_underpriced(self):
-        """pack_mid < fair − edge → BUY_PACK."""
-        arb, api = _make_ready_etf_arb(edge=12.0)
-        with patch.object(arb, "_get_cached_fair", return_value=300.0), \
-             patch("stat_arb.mc_delta", return_value=0.0):
-            result = arb.step(etf_mid=6500.0, pack_mid=280.0)  # mis=−20 < −12
-        self.assertTrue(result["action"].startswith("BUY_PACK"),
-                        f"Expected BUY_PACK, got: {result['action']!r}")
-
-    def test_hedge_order_submitted_with_sell_pack(self):
-        """Selling LON_FLY should trigger a delta-hedge order in LON_ETF."""
-        arb, api = _make_ready_etf_arb(edge=12.0)
-        # mc_delta = +1.5 → hedge_qty = round(1.5 * clip) = positive → BUY LON_ETF
-        with patch.object(arb, "_get_cached_fair", return_value=300.0), \
-             patch("stat_arb.mc_delta", return_value=1.5):
-            arb.step(etf_mid=6500.0, pack_mid=320.0)
-
-        calls = api.place_order.call_args_list
-        products = [c[0][0] for c in calls]
-        sides    = [c[0][1].upper() for c in calls]
-        # First order: sell the package
-        self.assertIn("LON_FLY", products)
-        self.assertIn("SELL", sides)
-        # Second order: hedge with ETF
-        self.assertIn("LON_ETF", products)
+    def test_basket_arb_no_data_returns_early(self):
+        from stat_arb import ETFBasketArb
+        api = MagicMock()
+        api.HARD_LIMIT = 100
+        api.get_mid.return_value = float("nan")
+        arb = ETFBasketArb(api=api)
+        result = arb.step()
+        self.assertEqual(result["action"], "NO_DATA")
 
 
 # ── Position compliance (explicit ±100 boundary tests) ───────────────────────
