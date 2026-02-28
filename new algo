@@ -1,0 +1,242 @@
+import time
+import numpy as np
+
+# -------------------------
+# Payoffs
+# -------------------------
+def call_payoff(S, K):
+    return np.maximum(0.0, S - K)
+
+def put_payoff(S, K):
+    return np.maximum(0.0, K - S)
+
+def etf_pack_payoff(S):
+    return (
+        2.0 * put_payoff(S, 6200.0)
+        + 1.0 * call_payoff(S, 6200.0)
+        - 2.0 * call_payoff(S, 6600.0)
+        + 3.0 * call_payoff(S, 7000.0)
+    )
+
+# -------------------------
+# Simple models
+# -------------------------
+class EWMA:
+    def __init__(self, alpha=0.05):
+        self.alpha = alpha
+        self.mu = None
+        self.var = None
+
+    def update(self, x):
+        x = float(x)
+        if self.mu is None:
+            self.mu = x
+            self.var = 1.0
+            return self.mu, np.sqrt(self.var)
+        dx = x - self.mu
+        self.mu = (1 - self.alpha) * self.mu + self.alpha * x
+        self.var = (1 - self.alpha) * self.var + self.alpha * (dx * dx)
+        return self.mu, np.sqrt(self.var)
+
+def mc_fair(payoff_fn, mu, sigma, n=40000, seed=7):
+    rng = np.random.default_rng(seed)
+    sims = rng.normal(mu, max(1e-6, sigma), size=n)
+    return float(np.mean(payoff_fn(sims)))
+
+def mc_delta(payoff_fn, mu, sigma, bump=1.0, n=25000, seed=11):
+    rng = np.random.default_rng(seed)
+    sims = rng.normal(mu, max(1e-6, sigma), size=n)
+    up = payoff_fn(sims + bump)
+    dn = payoff_fn(sims - bump)
+    return float(np.mean((up - dn) / (2.0 * bump)))
+
+# -------------------------
+# API adapter (replace)
+# -------------------------
+class ExchangeAPI:
+    def get_mid(self, product):
+        raise NotImplementedError
+
+    def get_best_bid_ask(self, product):
+        raise NotImplementedError
+
+    def place_order(self, product, side, price, qty):
+        raise NotImplementedError
+
+    def get_position(self, product):
+        raise NotImplementedError
+
+# -------------------------
+# 0) Flatten inventory NOW
+# -------------------------
+def flatten_all(api: ExchangeAPI, products: list[str], clip=20):
+    for p in products:
+        pos = api.get_position(p)
+        if pos == 0:
+            continue
+        bid, ask = api.get_best_bid_ask(p)
+        qty = int(min(abs(pos), clip))
+        if pos > 0:
+            api.place_order(p, "SELL", bid, qty)
+        if pos < 0:
+            api.place_order(p, "BUY", ask, qty)
+
+# -------------------------
+# 1) Regime drift: bias settlement expectation
+# -------------------------
+def drifted_mu(mu_now, drift_per_hour, hours_left):
+    return float(mu_now + drift_per_hour * hours_left)
+
+# -------------------------
+# 2) Regime trader (directional with strict caps)
+# -------------------------
+class RegimeDirectional:
+    def __init__(self, api, product, direction, max_pos, clip, edge):
+        self.api = api
+        self.product = product
+        self.direction = direction   # "UP" or "DOWN"
+        self.max_pos = max_pos
+        self.clip = clip
+        self.edge = edge
+        self.model = EWMA(alpha=0.06)
+
+    def step(self):
+        mid = self.api.get_mid(self.product)
+        mu, sig = self.model.update(mid)
+
+        pos = self.api.get_position(self.product)
+        bid, ask = self.api.get_best_bid_ask(self.product)
+
+        if self.direction == "DOWN":
+            target = -self.max_pos
+            room = max(0, pos - target)
+            if room > 0 and (mid > mu + self.edge * sig):
+                qty = int(min(self.clip, room))
+                self.api.place_order(self.product, "SELL", bid, qty)
+                return {"p": self.product, "act": f"SELL {qty}", "pos": pos, "mid": mid}
+
+        if self.direction == "UP":
+            target = self.max_pos
+            room = max(0, target - pos)
+            if room > 0 and (mid < mu - self.edge * sig):
+                qty = int(min(self.clip, room))
+                self.api.place_order(self.product, "BUY", ask, qty)
+                return {"p": self.product, "act": f"BUY {qty}", "pos": pos, "mid": mid}
+
+        return {"p": self.product, "act": "HOLD", "pos": pos, "mid": mid}
+
+# -------------------------
+# 3) ETF vs Pack arb (but mu is drifted by regime)
+# -------------------------
+class ETFPackArbRegime:
+    def __init__(self, api, etf, pack, max_pos, clip, hedge_clip, edge):
+        self.api = api
+        self.etf = etf
+        self.pack = pack
+        self.max_pos = max_pos
+        self.clip = clip
+        self.hedge_clip = hedge_clip
+        self.edge = edge
+        self.model = EWMA(alpha=0.05)
+
+    def step(self, drift_per_hour, hours_left):
+        etf_mid = self.api.get_mid(self.etf)
+        pack_mid = self.api.get_mid(self.pack)
+
+        mu_now, sigma = self.model.update(etf_mid)
+        mu = drifted_mu(mu_now, drift_per_hour, hours_left)
+
+        fair = mc_fair(etf_pack_payoff, mu, sigma, n=45000)
+        mis = pack_mid - fair
+
+        pack_pos = self.api.get_position(self.pack)
+        etf_pos = self.api.get_position(self.etf)
+
+        bid_p, ask_p = self.api.get_best_bid_ask(self.pack)
+        bid_e, ask_e = self.api.get_best_bid_ask(self.etf)
+
+        room_buy = max(0, self.max_pos - pack_pos)
+        room_sell = max(0, self.max_pos + pack_pos)
+
+        if mis > self.edge and room_sell > 0:
+            qty = int(min(self.clip, room_sell))
+            self.api.place_order(self.pack, "SELL", bid_p, qty)
+
+            d = mc_delta(etf_pack_payoff, mu, sigma)
+            h = int(np.clip(d * qty, -self.hedge_clip, self.hedge_clip))
+            if h > 0:
+                self.api.place_order(self.etf, "BUY", ask_e, h)
+            if h < 0:
+                self.api.place_order(self.etf, "SELL", bid_e, -h)
+
+            return {"act": f"SELL pack {qty}, hedge {h}", "mis": mis, "pack_pos": pack_pos, "etf_pos": etf_pos}
+
+        if mis < -self.edge and room_buy > 0:
+            qty = int(min(self.clip, room_buy))
+            self.api.place_order(self.pack, "BUY", ask_p, qty)
+
+            d = mc_delta(etf_pack_payoff, mu, sigma)
+            h = int(np.clip(d * qty, -self.hedge_clip, self.hedge_clip))
+            if h > 0:
+                self.api.place_order(self.etf, "SELL", bid_e, h)
+            if h < 0:
+                self.api.place_order(self.etf, "BUY", ask_e, -h)
+
+            return {"act": f"BUY pack {qty}, hedge {-h}", "mis": mis, "pack_pos": pack_pos, "etf_pos": etf_pos}
+
+        return {"act": "HOLD", "mis": mis, "pack_pos": pack_pos, "etf_pos": etf_pos}
+
+# -------------------------
+# Main: flatten -> run regime
+# -------------------------
+def run_regime(api: ExchangeAPI):
+    products = [
+        "LHR_COUNT", "LON_FLY", "LHR_INDEX",
+        "TIDE_SWING", "TIDE_SPOT",
+        "WX_SUM", "WX_SPOT",
+        "LON_ETF", "ETF_PACK_8",
+    ]
+
+    # 0) Flatten everything first (repeat a few loops)
+    for _ in range(8):
+        flatten_all(api, products, clip=25)
+        time.sleep(0.2)
+
+    # 1) Directional regime sizing (bigger on Thames + Temp-proxy if you have it)
+    # If you have explicit TEMP / HUM products, add them here with higher max_pos.
+    traders = [
+        RegimeDirectional(api, "LHR_COUNT", direction="DOWN", max_pos=40, clip=8, edge=0.6),
+        RegimeDirectional(api, "LON_FLY", direction="DOWN", max_pos=40, clip=8, edge=0.6),
+        RegimeDirectional(api, "TIDE_SPOT", direction="DOWN", max_pos=90, clip=15, edge=0.45),
+        RegimeDirectional(api, "TIDE_SWING", direction="DOWN", max_pos=90, clip=15, edge=0.45),
+        RegimeDirectional(api, "WX_SPOT", direction="UP", max_pos=25, clip=6, edge=0.8),  # humidity up proxy
+        RegimeDirectional(api, "WX_SUM", direction="DOWN", max_pos=25, clip=6, edge=0.8), # temp down proxy
+    ]
+
+    # 2) ETF pack arb stays on (lower risk than pure directional)
+    arb = ETFPackArbRegime(
+        api=api,
+        etf="LON_ETF",
+        pack="ETF_PACK_8",
+        max_pos=25,
+        clip=5,
+        hedge_clip=10,
+        edge=14.0,
+    )
+
+    # 3) Regime drift assumptions for ETF (since components trending)
+    # Tune these numbers to your game's scale:
+    # negative drift since flights down + thames down + temp down (ETF likely down)
+    etf_drift_per_hour = -35.0
+    hours_left = 6.0
+
+    while True:
+        # shrink hours_left as time passes
+        hours_left = max(0.0, hours_left - (0.2 / 3600.0))
+
+        for tr in traders:
+            tr.step()
+
+        arb.step(drift_per_hour=etf_drift_per_hour, hours_left=hours_left)
+
+        time.sleep(0.2)
