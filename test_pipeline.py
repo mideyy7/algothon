@@ -469,6 +469,11 @@ class TestWeatherFetcherMocked(unittest.TestCase):
 
 class TestFlightsFetcherMocked(unittest.TestCase):
 
+    def setUp(self):
+        # _historical_chunk_cache is module-level; clear it so tests don't share state
+        import data_pipeline.flights as fl_mod
+        fl_mod._historical_chunk_cache.clear()
+
     def _make_flight_response(self, n_arrivals: int, n_departures: int, base_dt: str, start_hour: int = 12):
         """Build a fake AeroDataBox response.
 

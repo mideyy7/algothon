@@ -21,7 +21,6 @@ Market 6 — LHR_INDEX
 """
 
 import logging
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -95,12 +94,11 @@ def _fetch_chunk(
     Raises:
         RuntimeError: If every retry attempt fails for this chunk.
 
-    NOTE: If the AeroDataBox response structure differs from what is expected
-    here, adjust the key paths inside the loop below. The relevant fields are:
-      - For departures: flight["departure"]["scheduledTime"]["local"] or
-                        flight["departure"]["actualTime"]["local"]
-      - For arrivals:   flight["arrival"]["scheduledTime"]["local"] or
-                        flight["arrival"]["actualTime"]["local"]
+    NOTE: If the AeroDataBox response structure changes, update _parse_flight_time.
+    Current structure (both arrivals and departures):
+      flight["movement"]["runwayTime"]["local"]    — actual runway time (preferred)
+      flight["movement"]["revisedTime"]["local"]   — gate revised time
+      flight["movement"]["scheduledTime"]["local"] — original schedule (fallback)
     """
     # AeroDataBox expects local London time in the URL path: YYYY-MM-DDTHH:mm
     fmt = "%Y-%m-%dT%H:%M"

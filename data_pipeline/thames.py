@@ -17,7 +17,6 @@ Market 2 — TIDE_SWING
 """
 
 import logging
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -75,10 +74,12 @@ def fetch_thames_readings(
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
 
+    # Always send UTC to the API — convert if the caller passed London time (handles BST)
+    since_utc = since.astimezone(timezone.utc)
     params = {
         "_sorted": "true",
         "_limit": limit,
-        "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "since": since_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
     try:

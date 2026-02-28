@@ -294,16 +294,12 @@ class DataPipeline:
         m4 = compute_wx_sum(weather, self.window_start, self.window_end)
 
         # --- Markets 5 & 6 (Flights) ---
+        # AeroDataBox returns ALL flights for the full queried window (historical actuals
+        # + future scheduled), so the count is already a full-window estimate from the
+        # first fetch — no linear projection needed (unlike Thames which accumulates).
         if flights:
-            if elapsed_fraction >= 1.0:
-                # Window complete — use actuals directly
-                m5: Optional[float] = float(compute_lhr_count(flights))
-                m6: Optional[float] = compute_lhr_index(flights)
-            else:
-                # Midway through — project to full 24-h total
-                proj_count, proj_index = project_lhr_values(flights, elapsed_fraction)
-                m5 = proj_count
-                m6 = proj_index
+            m5: Optional[float] = float(compute_lhr_count(flights))
+            m6: Optional[float] = compute_lhr_index(flights)
         else:
             m5 = None
             m6 = None

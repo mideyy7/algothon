@@ -23,7 +23,7 @@ Market 4 — WX_SUM
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 import zoneinfo
 
