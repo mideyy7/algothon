@@ -313,13 +313,29 @@ class DataPipeline:
         m8 = compute_lon_fly(m7)
 
         # --- Compute real-time "Current Raw" for Quants ---
+        # M1: Latest reading
         raw_m1 = abs(thames[-1].value_maod) * 1000 if thames else None
         
-        # We can calculate a "live" ETF using the real-time M1 and the current estimates for WX/LHR
+        # M2: The running sum without the forward projection
+        raw_m2 = m2_running
+        
+        # M3 & M4: Since these use forecasts, the "raw" real-time is effectively the same as the estimate
+        # but we provide it for completeness
+        raw_m3 = m3
+        raw_m4 = m4
+        
+        # M5: The running count without the forward projection
+        raw_m5 = None
+        raw_m6 = None
+        if flights:
+            raw_m5 = float(compute_lhr_count(flights))
+            raw_m6 = float(compute_lhr_index(flights))
+        
+        # M7 & M8: Live derived values based on raw inputs
         raw_m7 = None
         raw_m8 = None
-        if raw_m1 is not None and m3 is not None and m5 is not None:
-            raw_m7 = abs(raw_m1 + m3 + m5)
+        if raw_m1 is not None and raw_m3 is not None and raw_m5 is not None:
+            raw_m7 = abs(raw_m1 + raw_m3 + raw_m5)
             raw_m8 = compute_lon_fly(raw_m7)
 
         return MarketEstimates(
@@ -334,6 +350,11 @@ class DataPipeline:
             window_elapsed_fraction=elapsed_fraction,
             current_raw_data={
                 "TIDE_SPOT": raw_m1,
+                "TIDE_SWING": raw_m2,
+                "WX_SPOT": raw_m3,
+                "WX_SUM": raw_m4,
+                "LHR_COUNT": raw_m5,
+                "LHR_INDEX": raw_m6,
                 "LON_ETF": raw_m7,
                 "LON_FLY": raw_m8
             }
