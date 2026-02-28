@@ -23,10 +23,15 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+# ── Load .env from the project root before reading any env vars ───────────────
+load_dotenv(Path(__file__).parent / ".env")
 
 # ── Project root on sys.path ─────────────────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +41,7 @@ if _ROOT not in sys.path:
 from imc_template.bot_template import BaseBot, OrderBook, OrderRequest, Trade, Side
 from data_pipeline import DataPipeline, get_market_window
 from quant_models import fill_missing_estimates
+from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageArb
 
 # ── Risk framework ─────────────────────────────────────────────────────────
 _RISK_AVAILABLE = False
@@ -113,6 +119,21 @@ class IMCBot(BaseBot):
             _DEFAULT_PRIZE_CURVE if _RISK_AVAILABLE else pd.DataFrame()
         )
 
+        # ── Stat-arb strategies ─────────────────────────────────────────────
+        # Adapter bridges arb strategies to this bot's order/position methods.
+        self._exchange_adapter = BotExchangeAdapter(self)
+
+        # Strategy A: TIDE_SWING mean-reversion (Market 2)
+        self._tide_swing_arb = VolatileOptionArb(
+            api=self._exchange_adapter,
+            product="TIDE_SWING",
+        )
+
+        # Strategy B: LON_FLY vs LON_ETF MC pricer (Markets 7 & 8)
+        self._etf_package_arb = ETFPackageArb(
+            api=self._exchange_adapter,
+        )
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -140,22 +161,32 @@ class IMCBot(BaseBot):
     def on_orderbook(self, orderbook: OrderBook) -> None:
         """Called by the SSE thread on every orderbook update.
 
-        Throttled per-product to MIN_REQUOTE_SECS to avoid hammering the
-        exchange with cancels/replaces on every tick.
+        Flow:
+          1. Compute and cache the mid price (needed by arb strategies).
+          2. Run stat-arb strategies (every tick; each has its own cooldown).
+          3. Run market maker (throttled to MIN_REQUOTE_SECS per product).
         """
         product = orderbook.product
-        now = time.monotonic()
 
+        # ── Step 1: mid price ───────────────────────────────────────────────
+        mid = self._compute_mid(orderbook)
+        if mid is not None:
+            self._exchange_adapter.update_mid(product, mid)
+
+        # ── Step 2: stat-arb (unthrottled — own cooldowns govern frequency) ─
+        self._run_arb(product, mid)
+
+        # ── Step 3: market making (throttled per product) ───────────────────
+        now = time.monotonic()
         if now - self._last_quote.get(product, 0.0) < MIN_REQUOTE_SECS:
-            return  # too soon to requote this product
+            return
 
         try:
-            # Refresh fair values (TTL-cached — usually instant)
             self._refresh_fair_values()
 
             fair_value = self._fair_values.get(product)
             if fair_value is None:
-                return  # no price signal; skip silently
+                return
 
             with self._lock:
                 position = self._positions.get(product, 0)
@@ -164,7 +195,7 @@ class IMCBot(BaseBot):
             self._last_quote[product] = now
 
         except Exception:
-            log.exception("on_orderbook error for %s", product)
+            log.exception("on_orderbook MM error for %s", product)
 
     def on_trades(self, trade: Trade) -> None:
         """Called by the SSE thread on every market trade.
@@ -193,6 +224,49 @@ class IMCBot(BaseBot):
                 )
         except Exception:
             log.exception("on_trades error")
+
+    # ── Mid-price helper ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_mid(orderbook: OrderBook) -> Optional[float]:
+        """Return best-bid/ask mid, or the lone side if only one exists."""
+        has_bid = bool(orderbook.buy_orders)
+        has_ask = bool(orderbook.sell_orders)
+        if has_bid and has_ask:
+            return (orderbook.buy_orders[0].price + orderbook.sell_orders[0].price) / 2.0
+        if has_bid:
+            return float(orderbook.buy_orders[0].price)
+        if has_ask:
+            return float(orderbook.sell_orders[0].price)
+        return None
+
+    # ── Stat-arb dispatcher ────────────────────────────────────────────────
+
+    def _run_arb(self, product: str, mid: Optional[float]) -> None:
+        """Dispatch the current orderbook tick to the appropriate arb strategy.
+
+        Called on EVERY tick (before the MM throttle) so the arb strategies
+        see every price update.  Each strategy manages its own cooldown.
+        """
+        try:
+            if product == "TIDE_SWING" and mid is not None:
+                result = self._tide_swing_arb.step(mid=mid)
+                action = result.get("action", "")
+                if action not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN", "BLOCK_VOL", "NO_VOL"}:
+                    log.info("TideSwingArb: %s", action)
+
+            elif product in ("LON_ETF", "LON_FLY"):
+                etf_mid  = self._exchange_adapter.get_mid("LON_ETF")
+                pack_mid = self._exchange_adapter.get_mid("LON_FLY")
+                import math
+                if not (math.isnan(etf_mid) or math.isnan(pack_mid)):
+                    result = self._etf_package_arb.step(etf_mid=etf_mid, pack_mid=pack_mid)
+                    action = result.get("action", "")
+                    if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL"}:
+                        log.info("ETFPackageArb: %s", action)
+
+        except Exception:
+            log.exception("Arb error for product %s", product)
 
     # ── Quoting logic ──────────────────────────────────────────────────────
 
