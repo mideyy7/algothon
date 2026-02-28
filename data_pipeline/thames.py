@@ -139,7 +139,7 @@ def compute_tide_spot(
     delta_minutes = abs((best.dt - settlement_dt).total_seconds()) / 60.0
 
     if delta_minutes > tolerance_minutes:
-        log.warning(
+        log.debug(
             "TIDE_SPOT: closest reading is %.1f min from settlement target "
             "(tolerance=%d min) — returning None",
             delta_minutes, tolerance_minutes,
