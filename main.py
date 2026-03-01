@@ -11,7 +11,7 @@ Usage:
     export CMI_URL="http://<exchange-host>/"
     export CMI_USER="your_username"
     export CMI_PASS="your_password"
-    export RAPID_API_KEY="your_rapidapi_key"   # needed for M5/M6/M7/M8
+    export PIHUB_API_KEY="your_pihub_api_key"  # needed if PIHub requires auth (M5/M6/M7/M8)
 
     python main.py
 """
@@ -47,10 +47,10 @@ from stat_arb import (
     ETFBasketArb,
     # Regression-based stat arb (new algos)
     ETFPackStatArb, M2vsM1StatArb, UpDipBuyer,
-    # Trend capture (LHR_COUNT only)
-    RegimeDirectional,
+    # Pair-trading stat arb — LHR_COUNT vs LHR_INDEX (M5 / M6)
+    PairTradingArb,
     # Kept for potential future use / backward compat
-    VolatileOptionArb, ETFPackageImpliedVolArb,
+    RegimeDirectional, VolatileOptionArb, ETFPackageImpliedVolArb,
 )
 
 # ── Risk framework ─────────────────────────────────────────────────────────
@@ -176,11 +176,29 @@ class IMCBot(BaseBot):
             "WX_SPOT":   UpDipBuyer(self._exchange_adapter, "WX_SPOT",   max_pos=45, clip=8,  z_enter=1.6, z_take=0.3, cooldown=0.2),
         }
 
-        # Strategy E: Regime Directional (trend capture) — LHR_COUNT only.
-        # TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM are now handled by the new algos above.
-        self._regime_traders: dict[str, RegimeDirectional] = {
-            "LHR_COUNT": RegimeDirectional(self._exchange_adapter, "LHR_COUNT", "DOWN", 100, 25, 0.4),
-        }
+        # Strategy E: PairTradingArb — LHR_COUNT (M5) vs LHR_INDEX (M6).
+        # Both markets are derived from the same underlying Heathrow flight data,
+        # making them a natural pair.  Rolling OLS estimates the fair spread;
+        # z-score entry/exit mirrors the M2vsM1 approach.
+        self._pair_56 = PairTradingArb(
+            api=self._exchange_adapter,
+            pA="LHR_COUNT",
+            pB="LHR_INDEX",
+            max_pos_A=70,
+            max_pos_B=70,
+            clip_A=12,
+            clip_B=12,
+            z_enter=2.2,
+            z_exit=0.6,
+            cooldown=0.2,
+            ols_window=600,
+            resid_window=350,
+            hedge_clip=12,
+        )
+
+        # RegimeDirectional is retained for manual override / back-compat but is no
+        # longer registered for any product by default.
+        self._regime_traders: dict[str, RegimeDirectional] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -236,13 +254,11 @@ class IMCBot(BaseBot):
             self._refresh_fair_values()
 
             # ── MM Skip ────────────────────────────────────────────────────────────
-            # Disable passive MM for LHR_COUNT where the RegimeDirectional strategy
-            # takes a purely directional stance — stale fundamental prices would cause
-            # self-churn and toxic inventory build-up.
-            # TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM now use the new mean-reversion
-            # algos (M2vsM1StatArb + UpDipBuyer), which are compatible with MM running
-            # alongside them at the separate per-product throttle cadence.
-            if product in self._regime_traders:
+            # Disable passive MM for LHR_COUNT and LHR_INDEX: PairTradingArb takes
+            # active directional positions on both legs simultaneously.  Overlaying a
+            # passive MM would cause self-churn and toxic inventory build-up when the
+            # arb leg crosses the spread.
+            if product in ("LHR_COUNT", "LHR_INDEX"):
                 return
 
             fair_value = self._fair_values.get(product)
@@ -332,7 +348,7 @@ class IMCBot(BaseBot):
           TIDE_SPOT / WX_SUM / WX_SPOT → UpDipBuyer (EWMA mean-reversion)
           LON_ETF / LON_FLY → ETFPackStatArb (regression z-score arb, M7 & 8)
           LON_ETF / TIDE_SPOT / WX_SPOT / LHR_COUNT → ETFBasketArb (identity arb)
-          LHR_COUNT → RegimeDirectional (trend capture)
+          LHR_COUNT / LHR_INDEX → PairTradingArb (OLS pair arb, M5 & M6)
         """
         try:
             # ── Strategy A: M2vsM1 stat arb fires on tidal product ticks ──
@@ -363,7 +379,14 @@ class IMCBot(BaseBot):
                 if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL", "COOLDOWN", "CAPPED"}:
                     log.info("ETFBasketArb: %s", action)
 
-            # ── Strategy E: Regime directional (LHR_COUNT only) ──
+            # ── Strategy E: PairTradingArb fires on M5 / M6 ticks ──
+            if product in ("LHR_COUNT", "LHR_INDEX"):
+                result = self._pair_56.step()
+                act = result.get("act", "HOLD")
+                if act not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN"}:
+                    log.info("PairArb56 [%s]: %s", product, act)
+
+            # ── (No-op) Regime directional — currently unused, kept for override ──
             if product in self._regime_traders:
                 result = self._regime_traders[product].step()
                 action = result.get("action", "HOLD")

@@ -1168,6 +1168,214 @@ class UpDipBuyer:
 
 
 # ---------------------------------------------------------------------------
+# Pair-trading helpers (new2.py — M5 / M6 stat arb)
+# ---------------------------------------------------------------------------
+
+class RollingOLS2:
+    """Rolling OLS: y ~ a + b·x  (closed-form 2-parameter regression).
+
+    Requires at least 80 observations before fitting; returns last fitted
+    coefficients on early calls so callers always get a valid (a, b) pair.
+    """
+
+    def __init__(self, window: int = 500):
+        self._window = window
+        self._x: deque = deque(maxlen=window)
+        self._y: deque = deque(maxlen=window)
+        self.a: float = 0.0
+        self.b: float = 1.0
+
+    def add(self, x: float, y: float) -> None:
+        self._x.append(float(x))
+        self._y.append(float(y))
+
+    def fit(self) -> tuple[float, float]:
+        """Fit OLS on the rolling window and return (intercept, slope)."""
+        if len(self._x) < 80:
+            return self.a, self.b
+        x = np.array(self._x, dtype=float)
+        y = np.array(self._y, dtype=float)
+        mx  = float(x.mean())
+        my  = float(y.mean())
+        vx  = float(((x - mx) ** 2).mean()) + 1e-12   # regularise against flat x
+        cov = float(((x - mx) * (y - my)).mean())
+        self.b = cov / vx
+        self.a = my - self.b * mx
+        return self.a, self.b
+
+    def predict(self, x: float) -> float:
+        return float(self.a + self.b * float(x))
+
+
+class RollingResidZ:
+    """Rolling z-score of a sequence of residuals.
+
+    Returns NaN until at least 80 observations have been accumulated.
+    """
+
+    def __init__(self, n: int = 300):
+        self._r: deque = deque(maxlen=n)
+
+    def add(self, v: float) -> None:
+        self._r.append(float(v))
+
+    def z(self, v: float) -> float:
+        if len(self._r) < 80:
+            return float("nan")
+        arr = np.array(self._r, dtype=float)
+        mu  = float(arr.mean())
+        sd  = float(arr.std()) + 1e-9
+        return (float(v) - mu) / sd
+
+
+class PairTradingArb:
+    """Rolling OLS pair-trading stat arb between two correlated products.
+
+    Model:  pB ≈ a + β·pA
+    Signal: residual r = pB_mid − (a + β·pA_mid), normalised to z-score.
+
+    z > +z_enter  → pB is rich vs pA  → SELL pB,  BUY β-weighted pA
+    z < −z_enter  → pB is cheap vs pA → BUY  pB, SELL β-weighted pA
+    |z| < z_exit  → residual has decayed → flatten
+
+    Position limits (max_pos_A / max_pos_B) are in addition to the hard
+    ±100 enforced by BotExchangeAdapter.HARD_LIMIT.
+
+    Designed for Markets 5 & 6: pA = LHR_COUNT, pB = LHR_INDEX.
+    Both are derived from the same underlying flight data and therefore
+    share a latent factor that this OLS regression exploits.
+    """
+
+    def __init__(
+        self,
+        api,
+        pA: str,
+        pB: str,
+        max_pos_A: int = 70,
+        max_pos_B: int = 70,
+        clip_A: int = 12,
+        clip_B: int = 12,
+        z_enter: float = 2.2,
+        z_exit: float = 0.6,
+        cooldown: float = 0.2,
+        ols_window: int = 600,
+        resid_window: int = 350,
+        hedge_clip: int = 12,
+    ):
+        self.api = api
+        self.pA = pA
+        self.pB = pB
+        self.max_pos_A  = max_pos_A
+        self.max_pos_B  = max_pos_B
+        self.clip_A     = clip_A
+        self.clip_B     = clip_B
+        self.hedge_clip = hedge_clip
+        self.z_enter    = z_enter
+        self.z_exit     = z_exit
+        self.cooldown   = cooldown
+        self._last_t    = 0.0
+        self._ols = RollingOLS2(window=ols_window)
+        self._rz  = RollingResidZ(n=resid_window)
+
+    # ------------------------------------------------------------------
+
+    def _flatten(self, clip: int = 15) -> None:
+        """Market-order both legs towards flat."""
+        for p in (self.pA, self.pB):
+            pos = self.api.get_position(p)
+            if pos == 0:
+                continue
+            bbo = self.api.get_best_bid_ask(p)
+            if bbo is None:
+                continue
+            q = int(min(abs(pos), clip))
+            if pos > 0 and bbo.best_bid is not None:
+                self.api.place_order(p, "SELL", bbo.best_bid, q)
+            elif pos < 0 and bbo.best_ask is not None:
+                self.api.place_order(p, "BUY", bbo.best_ask, q)
+
+    def step(self) -> dict:
+        """Run one tick of the pair-trading strategy.
+
+        Returns a dict with keys: pair, act, z, beta.
+        """
+        a_mid = self.api.get_mid(self.pA)
+        b_mid = self.api.get_mid(self.pB)
+        if a_mid is None or b_mid is None or np.isnan(a_mid) or np.isnan(b_mid):
+            return {"pair": f"{self.pA}/{self.pB}", "act": "NO_DATA", "z": float("nan"), "beta": 0.0}
+
+        bbo_a = self.api.get_best_bid_ask(self.pA)
+        bbo_b = self.api.get_best_bid_ask(self.pB)
+        if bbo_a is None or bbo_b is None:
+            return {"pair": f"{self.pA}/{self.pB}", "act": "NO_DATA", "z": float("nan"), "beta": 0.0}
+
+        bid_a, ask_a = bbo_a.best_bid, bbo_a.best_ask
+        bid_b, ask_b = bbo_b.best_bid, bbo_b.best_ask
+
+        # Feed regression
+        self._ols.add(a_mid, b_mid)
+        _a, beta = self._ols.fit()
+
+        fair_b = self._ols.predict(a_mid)
+        resid  = b_mid - fair_b
+        self._rz.add(resid)
+        z = self._rz.z(resid)
+
+        pos_a = self.api.get_position(self.pA)
+        pos_b = self.api.get_position(self.pB)
+
+        now = time.time()
+        if now - self._last_t < self.cooldown:
+            return {"pair": f"{self.pA}/{self.pB}", "act": "COOLDOWN", "z": z, "beta": beta}
+
+        # WARMUP — not enough history yet
+        if np.isnan(z):
+            return {"pair": f"{self.pA}/{self.pB}", "act": "WARMUP", "z": z, "beta": beta}
+
+        # EXIT — residual has mean-reverted
+        if abs(z) < self.z_exit and (pos_a != 0 or pos_b != 0):
+            self._flatten(clip=12)
+            self._last_t = now
+            return {"pair": f"{self.pA}/{self.pB}", "act": "FLATTEN_EXIT", "z": z, "beta": beta}
+
+        # Hedge quantity in A per 1 unit of B
+        hedge_a = int(np.clip(round(beta), -self.hedge_clip, self.hedge_clip))
+        if hedge_a == 0:
+            hedge_a = 1   # minimum hedge of 1 unit
+
+        room_buy_a  = max(0, self.max_pos_A - pos_a)
+        room_sell_a = max(0, self.max_pos_A + pos_a)
+        room_buy_b  = max(0, self.max_pos_B - pos_b)
+        room_sell_b = max(0, self.max_pos_B + pos_b)
+
+        # z high → pB rich → SELL pB, BUY hedged pA
+        if z > self.z_enter and room_sell_b > 0 and bid_b is not None:
+            q_b = int(min(self.clip_B, room_sell_b))
+            self.api.place_order(self.pB, "SELL", bid_b, q_b)
+
+            q_a = int(min(self.clip_A, room_buy_a, abs(hedge_a) * q_b))
+            if q_a > 0 and ask_a is not None:
+                self.api.place_order(self.pA, "BUY", ask_a, q_a)
+
+            self._last_t = now
+            return {"pair": f"{self.pA}/{self.pB}", "act": f"SELL_B {q_b} BUY_A {q_a}", "z": z, "beta": beta}
+
+        # z low → pB cheap → BUY pB, SELL hedged pA
+        if z < -self.z_enter and room_buy_b > 0 and ask_b is not None:
+            q_b = int(min(self.clip_B, room_buy_b))
+            self.api.place_order(self.pB, "BUY", ask_b, q_b)
+
+            q_a = int(min(self.clip_A, room_sell_a, abs(hedge_a) * q_b))
+            if q_a > 0 and bid_a is not None:
+                self.api.place_order(self.pA, "SELL", bid_a, q_a)
+
+            self._last_t = now
+            return {"pair": f"{self.pA}/{self.pB}", "act": f"BUY_B {q_b} SELL_A {q_a}", "z": z, "beta": beta}
+
+        return {"pair": f"{self.pA}/{self.pB}", "act": "HOLD", "z": z, "beta": beta}
+
+
+# ---------------------------------------------------------------------------
 # Regime Directional Algorithm (Momentum & Trend Capturing)
 # ---------------------------------------------------------------------------
 

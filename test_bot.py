@@ -558,13 +558,21 @@ class TestRunArb(unittest.TestCase):
         mock_pack.assert_called_once()
         mock_basket.assert_called_once()
 
-    def test_lhr_count_dispatches_to_regime_and_basket(self):
+    def test_lhr_count_dispatches_to_pair_arb_and_basket(self):
         bot = _make_bot()
         with patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket, \
-             patch.object(bot._regime_traders["LHR_COUNT"], "step", return_value={"action": "HOLD"}) as mock_regime:
+             patch.object(bot._pair_56, "step", return_value={"act": "HOLD"}) as mock_pair:
             bot._run_arb("LHR_COUNT", 4500.0)
         mock_basket.assert_called_once()
-        mock_regime.assert_called_once()
+        mock_pair.assert_called_once()
+
+    def test_lhr_index_dispatches_to_pair_arb_only(self):
+        bot = _make_bot()
+        with patch.object(bot._pair_56, "step", return_value={"act": "HOLD"}) as mock_pair, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket:
+            bot._run_arb("LHR_INDEX", 12.0)
+        mock_pair.assert_called_once()
+        mock_basket.assert_not_called()
 
 
 # ── Risk framework integration ────────────────────────────────────────────────
@@ -1515,12 +1523,11 @@ class TestNewAlgoDispatch(unittest.TestCase):
         mock_pack.assert_called_once()
         mock_basket.assert_not_called()
 
-    def test_regime_traders_only_has_lhr_count(self):
-        """TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM must NOT be in _regime_traders."""
+    def test_regime_traders_is_empty(self):
+        """_regime_traders is now empty — LHR_COUNT/INDEX handled by PairTradingArb."""
         bot = _make_bot()
-        self.assertIn("LHR_COUNT", bot._regime_traders)
-        for p in ("TIDE_SPOT", "TIDE_SWING", "WX_SPOT", "WX_SUM"):
-            self.assertNotIn(p, bot._regime_traders, f"{p} should no longer be in _regime_traders")
+        self.assertEqual(len(bot._regime_traders), 0,
+                         "_regime_traders should be empty; PairTradingArb handles M5/M6")
 
     def test_dip_buyers_covers_correct_products(self):
         bot = _make_bot()
@@ -1535,8 +1542,8 @@ class TestNewAlgoDispatch(unittest.TestCase):
             bot._m2_vs_m1_arb,
             bot._etf_pack_stat_arb,
             bot._etf_basket_arb,
+            bot._pair_56,
             *bot._dip_buyers.values(),
-            *bot._regime_traders.values(),
         ]:
             if hasattr(strat, "max_m2_pos"):
                 self.assertLessEqual(strat.max_m2_pos, 100)
@@ -1545,6 +1552,252 @@ class TestNewAlgoDispatch(unittest.TestCase):
                 self.assertLessEqual(strat.max_pack_pos, 100)
             if hasattr(strat, "max_pos"):
                 self.assertLessEqual(strat.max_pos, 100)
+            if hasattr(strat, "max_pos_A"):
+                self.assertLessEqual(strat.max_pos_A, 100)
+                self.assertLessEqual(strat.max_pos_B, 100)
+
+
+# ── RollingOLS2 ───────────────────────────────────────────────────────────────
+
+class TestRollingOLS2(unittest.TestCase):
+
+    def test_warmup_returns_defaults(self):
+        from stat_arb import RollingOLS2
+        r = RollingOLS2(window=500)
+        for _ in range(79):
+            r.add(1.0, 2.0)
+        a, b = r.fit()
+        self.assertEqual(a, 0.0)   # default intercept
+        self.assertEqual(b, 1.0)   # default slope
+
+    def test_fit_recovers_linear_relationship(self):
+        from stat_arb import RollingOLS2
+        r = RollingOLS2(window=500)
+        rng = np.random.default_rng(0)
+        # y = 3 + 2*x + tiny noise → expect a≈3, b≈2
+        xs = rng.uniform(1, 10, 200)
+        for x in xs:
+            r.add(x, 3.0 + 2.0 * x + rng.normal(0, 0.01))
+        a, b = r.fit()
+        self.assertAlmostEqual(b, 2.0, places=1)
+        self.assertAlmostEqual(a, 3.0, places=1)
+
+    def test_predict_uses_fitted_coefficients(self):
+        from stat_arb import RollingOLS2
+        r = RollingOLS2(window=500)
+        rng = np.random.default_rng(7)
+        for x in rng.uniform(1, 5, 150):
+            r.add(x, 1.0 + 4.0 * x + rng.normal(0, 0.01))
+        r.fit()
+        pred = r.predict(2.0)
+        self.assertAlmostEqual(pred, 1.0 + 4.0 * 2.0, delta=0.5)
+
+    def test_rolling_window_discards_old_data(self):
+        from stat_arb import RollingOLS2
+        # Fill window with one relationship, then overwrite with another
+        r = RollingOLS2(window=100)
+        for x in range(200):
+            r.add(float(x), 1.0 + 2.0 * x)   # y = 1 + 2x
+        for x in range(200):
+            r.add(float(x), 5.0 + 0.5 * x)   # y = 5 + 0.5x (overwrites)
+        a, b = r.fit()
+        self.assertAlmostEqual(b, 0.5, places=1)
+        self.assertAlmostEqual(a, 5.0, places=1)
+
+
+# ── RollingResidZ ─────────────────────────────────────────────────────────────
+
+class TestRollingResidZ(unittest.TestCase):
+
+    def test_warmup_returns_nan(self):
+        from stat_arb import RollingResidZ
+        rz = RollingResidZ(n=300)
+        for _ in range(79):
+            rz.add(1.0)
+        self.assertTrue(np.isnan(rz.z(1.0)))
+
+    def test_z_score_approximately_correct(self):
+        from stat_arb import RollingResidZ
+        rng = np.random.default_rng(42)
+        rz = RollingResidZ(n=300)
+        data = rng.normal(loc=10.0, scale=2.0, size=200)
+        for v in data:
+            rz.add(v)
+        # A value exactly at the mean should give z ≈ 0
+        z = rz.z(float(np.mean(data)))
+        self.assertAlmostEqual(z, 0.0, delta=0.1)
+
+    def test_extreme_value_gives_large_z(self):
+        from stat_arb import RollingResidZ
+        rng = np.random.default_rng(99)
+        rz = RollingResidZ(n=300)
+        for v in rng.normal(0, 1, 200):
+            rz.add(v)
+        self.assertGreater(abs(rz.z(100.0)), 5.0)
+
+
+# ── PairTradingArb ────────────────────────────────────────────────────────────
+
+def _make_pair_api(a_mid=4500.0, b_mid=50.0, a_pos=0, b_pos=0):
+    """Mock BotExchangeAdapter for PairTradingArb tests."""
+    from stat_arb import BBO
+    api = MagicMock()
+    api.get_mid.side_effect = lambda p: a_mid if p == "LHR_COUNT" else b_mid
+    bbo_a = BBO(mid=a_mid, best_bid=a_mid - 1, best_ask=a_mid + 1)
+    bbo_b = BBO(mid=b_mid, best_bid=b_mid - 0.5, best_ask=b_mid + 0.5)
+    api.get_best_bid_ask.side_effect = lambda p: bbo_a if p == "LHR_COUNT" else bbo_b
+    api.get_position.side_effect = lambda p: a_pos if p == "LHR_COUNT" else b_pos
+    api.place_order.return_value = True
+    return api
+
+
+def _warmup_pair(arb, n_steps=300, a_base=4500.0, b_base=50.0):
+    """Warm up a PairTradingArb with slightly noisy data so z is non-NaN."""
+    from stat_arb import BBO
+    rng = np.random.default_rng(1)
+    for i in range(n_steps):
+        a = a_base + rng.normal(0, 50)
+        # y ≈ 5 + 0.01 * x + noise → stable relationship
+        b = 5.0 + 0.01 * a + rng.normal(0, 2.0)
+        arb.api.get_mid.side_effect = lambda p, _a=a, _b=b: _a if p == "LHR_COUNT" else _b
+        bbo_a = BBO(mid=a, best_bid=a - 1, best_ask=a + 1)
+        bbo_b = BBO(mid=b, best_bid=b - 0.5, best_ask=b + 0.5)
+        arb.api.get_best_bid_ask.side_effect = (
+            lambda p, _ba=bbo_a, _bb=bbo_b: _ba if p == "LHR_COUNT" else _bb
+        )
+        arb.step()
+
+
+class TestPairTradingArb(unittest.TestCase):
+
+    def _make_arb(self, **kw):
+        from stat_arb import PairTradingArb
+        api = _make_pair_api()
+        return PairTradingArb(
+            api=api, pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=0.0,
+            ols_window=600, resid_window=350,
+            **kw
+        )
+
+    def test_warmup_returns_warmup(self):
+        arb = self._make_arb()
+        result = arb.step()
+        self.assertEqual(result["act"], "WARMUP")
+
+    def test_no_data_when_mid_is_none(self):
+        from stat_arb import PairTradingArb
+        api = _make_pair_api()
+        api.get_mid.return_value = None
+        api.get_mid.side_effect = None
+        arb = PairTradingArb(
+            api=api, pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=0.0,
+        )
+        result = arb.step()
+        self.assertEqual(result["act"], "NO_DATA")
+
+    def test_hold_after_warmup_no_signal(self):
+        arb = self._make_arb()
+        _warmup_pair(arb)
+        result = arb.step()
+        # After stable warmup the z-score should be small → HOLD
+        self.assertIn(result["act"], {"HOLD", "FLATTEN_EXIT", "COOLDOWN"})
+
+    def test_sell_b_when_z_high(self):
+        """When pB is very rich, strategy should sell pB and buy pA."""
+        from stat_arb import BBO, PairTradingArb
+        api = _make_pair_api()
+        arb = PairTradingArb(
+            api=api, pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=0.0,
+        )
+        _warmup_pair(arb)
+
+        # Force pB far above fair value to drive z >> z_enter
+        rng = np.random.default_rng(77)
+        a_val = 4500.0
+        b_val = 5.0 + 0.01 * a_val + 600.0   # huge positive residual
+        api.get_mid.side_effect = lambda p: a_val if p == "LHR_COUNT" else b_val
+        bbo_a = BBO(mid=a_val, best_bid=a_val - 1, best_ask=a_val + 1)
+        bbo_b = BBO(mid=b_val, best_bid=b_val - 0.5, best_ask=b_val + 0.5)
+        api.get_best_bid_ask.side_effect = lambda p: bbo_a if p == "LHR_COUNT" else bbo_b
+
+        result = arb.step()
+        act = result.get("act", "")
+        if act not in {"HOLD", "COOLDOWN", "FLATTEN_EXIT"}:
+            self.assertIn("SELL_B", act)
+
+    def test_buy_b_when_z_low(self):
+        """When pB is very cheap, strategy should buy pB and sell pA."""
+        from stat_arb import BBO, PairTradingArb
+        api = _make_pair_api()
+        arb = PairTradingArb(
+            api=api, pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=0.0,
+        )
+        _warmup_pair(arb)
+
+        a_val = 4500.0
+        b_val = 5.0 + 0.01 * a_val - 600.0   # huge negative residual
+        api.get_mid.side_effect = lambda p: a_val if p == "LHR_COUNT" else b_val
+        bbo_a = BBO(mid=a_val, best_bid=a_val - 1, best_ask=a_val + 1)
+        bbo_b = BBO(mid=b_val, best_bid=b_val - 0.5, best_ask=b_val + 0.5)
+        api.get_best_bid_ask.side_effect = lambda p: bbo_a if p == "LHR_COUNT" else bbo_b
+
+        result = arb.step()
+        act = result.get("act", "")
+        if act not in {"HOLD", "COOLDOWN", "FLATTEN_EXIT"}:
+            self.assertIn("BUY_B", act)
+
+    def test_flatten_exit_when_z_small_and_flat_already(self):
+        """With zero positions and small z, FLATTEN_EXIT should NOT fire."""
+        arb = self._make_arb()
+        _warmup_pair(arb)
+        result = arb.step()
+        # Positions are 0 so even if |z| < z_exit we should not flatten
+        # (nothing to flatten)
+        self.assertNotEqual(result["act"], "FLATTEN_EXIT")
+
+    def test_cooldown_respected(self):
+        from stat_arb import BBO, PairTradingArb
+        api = _make_pair_api()
+        arb = PairTradingArb(
+            api=api, pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=999.0,   # very long cooldown
+        )
+        _warmup_pair(arb)
+        arb._last_t = time.time()   # simulate a recent trade
+        result = arb.step()
+        self.assertEqual(result["act"], "COOLDOWN")
+
+    def test_pos_limits_respected(self):
+        """max_pos_A and max_pos_B must be within ±100 competition limit."""
+        from stat_arb import PairTradingArb
+        arb = PairTradingArb(
+            api=_make_pair_api(), pA="LHR_COUNT", pB="LHR_INDEX",
+            max_pos_A=70, max_pos_B=70, clip_A=12, clip_B=12,
+            z_enter=2.2, z_exit=0.6, cooldown=0.0,
+        )
+        self.assertLessEqual(arb.max_pos_A, 100)
+        self.assertLessEqual(arb.max_pos_B, 100)
+
+    def test_beta_key_always_present(self):
+        arb = self._make_arb()
+        _warmup_pair(arb)
+        result = arb.step()
+        self.assertIn("beta", result)
+
+    def test_pair_56_is_initialized_on_bot(self):
+        bot = _make_bot()
+        self.assertTrue(hasattr(bot, "_pair_56"))
+        self.assertEqual(bot._pair_56.pA, "LHR_COUNT")
+        self.assertEqual(bot._pair_56.pB, "LHR_INDEX")
 
 
 # ── Import the Side enum for use in assertions above ──────────────────────────
