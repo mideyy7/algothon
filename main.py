@@ -41,7 +41,7 @@ if _ROOT not in sys.path:
 from imc_template.bot_template import BaseBot, OrderBook, OrderRequest, Trade, Side
 from data_pipeline import DataPipeline, get_market_window
 from quant_models import fill_missing_estimates
-from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageImpliedVolArb, ETFBasketArb, BBO
+from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageImpliedVolArb, ETFBasketArb, BBO, RegimeDirectional
 
 # ── Risk framework ─────────────────────────────────────────────────────────
 _RISK_AVAILABLE = False
@@ -139,6 +139,16 @@ class IMCBot(BaseBot):
             api=self._exchange_adapter,
         )
 
+        # Strategy D: Regime Directional Traders (Trend Capture)
+        # Maximizing size limits and softening edges for extreme aggression
+        self._regime_traders = {
+            "LHR_COUNT": RegimeDirectional(self._exchange_adapter, "LHR_COUNT", "DOWN", 100, 25, 0.4),
+            "TIDE_SPOT": RegimeDirectional(self._exchange_adapter, "TIDE_SPOT", "DOWN", 100, 25, 0.3),
+            "TIDE_SWING": RegimeDirectional(self._exchange_adapter, "TIDE_SWING", "DOWN", 100, 25, 0.3),
+            "WX_SPOT": RegimeDirectional(self._exchange_adapter, "WX_SPOT", "UP", 100, 25, 0.4),
+            "WX_SUM": RegimeDirectional(self._exchange_adapter, "WX_SUM", "DOWN", 100, 25, 0.4),
+        }
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -192,6 +202,13 @@ class IMCBot(BaseBot):
         try:
             self._refresh_fair_values()
 
+            # ── MM Skip ────────────────────────────────────────────────────────────
+            # Completely disable passive market making for purely directional assets.
+            # If we don't skip, the stale fundamental prices will force the MM to cleanly 
+            # buy against our structural DOWN trends, causing self-churn and toxic inventory.
+            if product in self._regime_traders:
+                return
+
             fair_value = self._fair_values.get(product)
             if fair_value is None:
                 return
@@ -199,7 +216,18 @@ class IMCBot(BaseBot):
             with self._lock:
                 position = self._positions.get(product, 0)
 
-            self._place_quotes(product, fair_value, position, orderbook.tick_size)
+            # ── Safety Constraint: Bounding the MM Anchor ────────────────────
+            # If our fundamental model (fair_value) predicts an extreme move,
+            # we must NOT cross the book and blindly buy falling knives.
+            # We clip the quoting anchor strictly to within ± 0.5% of the live
+            # mid-price. This captures the spread while maintaining an edge pull.
+            if mid is not None and not np.isnan(mid) and mid > 0:
+                max_dev = mid * 0.005
+                anchor_price = float(np.clip(fair_value, mid - max_dev, mid + max_dev))
+            else:
+                anchor_price = fair_value
+
+            self._place_quotes(product, anchor_price, position, orderbook.tick_size)
             self._last_quote[product] = now
 
         except Exception:
@@ -264,6 +292,14 @@ class IMCBot(BaseBot):
         see every price update.  Each strategy manages its own cooldown.
         """
         try:
+            # Execute directional regime trader if applicable
+            if product in self._regime_traders:
+                result = self._regime_traders[product].step()
+                action = result.get("action", "")
+                if action not in {"HOLD", "NO_DATA"}:
+                    log.info("Regime %s: %s", product, action)
+
+            # Keep legacy arb for metrics (optional)
             if product == "TIDE_SWING" and mid is not None:
                 result = self._tide_swing_arb.step(mid=mid)
                 action = result.get("action", "")

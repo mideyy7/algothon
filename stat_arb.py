@@ -698,3 +698,80 @@ class ETFPackageImpliedVolArb:
             "pack_pos": pack_pos,
             "action": act,
         }
+
+
+# ---------------------------------------------------------------------------
+# Regime Directional Algorithm (Momentum & Trend Capturing)
+# ---------------------------------------------------------------------------
+
+class RegimeEWMA:
+    def __init__(self, alpha: float = 0.05):
+        self.alpha = alpha
+        self.mu: Optional[float] = None
+        self.var: Optional[float] = None
+
+    def update(self, x: float) -> tuple[float, float]:
+        x = float(x)
+        if self.mu is None or self.var is None:
+            self.mu = x
+            self.var = 1.0
+            return self.mu, float(np.sqrt(self.var))
+        dx = x - self.mu
+        self.mu = (1 - self.alpha) * self.mu + self.alpha * x
+        self.var = (1 - self.alpha) * self.var + self.alpha * (dx * dx)
+        return self.mu, float(np.sqrt(self.var))
+
+
+class RegimeDirectional:
+    """Takes aggressively scaled position sizing leaning into structural trends."""
+    
+    def __init__(
+        self,
+        api: BotExchangeAdapter,
+        product: str,
+        direction: str,
+        max_pos: int,
+        clip: int,
+        edge: float,
+        alpha: float = 0.06
+    ) -> None:
+        self.api = api
+        self.product = product
+        self.direction = direction   # "UP" or "DOWN"
+        self.max_pos = min(int(max_pos), api.HARD_LIMIT)
+        self.clip = int(clip)
+        self.edge = float(edge)
+        self.model = RegimeEWMA(alpha=alpha)
+
+    def step(self) -> Dict[str, Any]:
+        bbo = self.api.get_best_bid_ask(self.product)
+        if not bbo or bbo.mid is None or np.isnan(bbo.mid):
+            return {"action": "NO_DATA"}
+
+        mid = float(bbo.mid)
+        mu, sig = self.model.update(mid)
+
+        pos = self.api.get_position(self.product)
+        bid = bbo.best_bid
+        ask = bbo.best_ask
+        
+        if bid is None or ask is None:
+            return {"action": "NO_DATA"}
+
+        if self.direction == "DOWN":
+            target = -self.max_pos
+            room = max(0, pos - target)
+            if room > 0 and (mid > mu + self.edge * sig):
+                qty = int(min(self.clip, room))
+                if self.api.place_order(self.product, "SELL", bid, qty):
+                    return {"action": f"SELL {qty}", "pos": pos, "mid": mid}
+
+        if self.direction == "UP":
+            target = self.max_pos
+            room = max(0, target - pos)
+            if room > 0 and (mid < mu - self.edge * sig):
+                qty = int(min(self.clip, room))
+                if self.api.place_order(self.product, "BUY", ask, qty):
+                    return {"action": f"BUY {qty}", "pos": pos, "mid": mid}
+
+        return {"action": "HOLD", "pos": pos, "mid": mid}

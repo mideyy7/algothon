@@ -115,6 +115,7 @@ def _make_bot(username: str = "testuser", positions: Optional[dict] = None):
     bot.__dict__["auth_token"] = "Bearer test-token"
     bot.username = username
     bot._positions = dict(positions) if positions else {}
+    bot._regime_traders = {}
     return bot
 
 
