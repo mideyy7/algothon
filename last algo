@@ -1,0 +1,673 @@
+import time
+import numpy as np
+from collections import deque
+
+# ============================================================
+# Plug in your platform
+# ============================================================
+class ExchangeAPI:
+    def get_mid(self, product: str) -> float:
+        raise NotImplementedError
+
+    def get_best_bid_ask(self, product: str) -> tuple[float, float]:
+        raise NotImplementedError
+
+    def place_order(self, product: str, side: str, price: float, qty: int):
+        raise NotImplementedError
+
+    def get_position(self, product: str) -> int:
+        raise NotImplementedError
+
+
+# ============================================================
+# Utilities
+# ============================================================
+def clip_int(x, lo, hi):
+    return int(max(lo, min(hi, int(x))))
+
+class RollingStd:
+    def __init__(self, n=250):
+        self.x = deque(maxlen=n)
+
+    def add(self, v: float):
+        self.x.append(float(v))
+
+    def mean(self):
+        return float(np.mean(self.x)) if len(self.x) else np.nan
+
+    def std(self):
+        if len(self.x) < 40:
+            return np.nan
+        return float(np.std(self.x) + 1e-9)
+
+class RollingZ:
+    def __init__(self, n=350):
+        self.x = deque(maxlen=n)
+
+    def add(self, v: float):
+        self.x.append(float(v))
+
+    def z(self, v: float):
+        if len(self.x) < 80:
+            return np.nan
+        arr = np.array(self.x, dtype=float)
+        mu = float(arr.mean())
+        sd = float(arr.std() + 1e-9)
+        return (float(v) - mu) / sd
+
+class EWMA:
+    def __init__(self, alpha=0.06):
+        self.alpha = alpha
+        self.mu = None
+
+    def update(self, x: float) -> float:
+        x = float(x)
+        self.mu = x if self.mu is None else (1 - self.alpha) * self.mu + self.alpha * x
+        return self.mu
+
+class RollingRV:
+    def __init__(self, n=120):
+        self.px = deque(maxlen=n + 1)
+
+    def update(self, p: float) -> float:
+        self.px.append(float(p))
+        if len(self.px) < 25:
+            return np.nan
+        r = np.diff(np.log(np.array(self.px)))
+        return float(np.sqrt(np.mean(r * r)))
+
+class RollingOLS2:
+    # y ~ a + b*x
+    def __init__(self, window=600):
+        self.x = deque(maxlen=window)
+        self.y = deque(maxlen=window)
+        self.a = 0.0
+        self.b = 1.0
+
+    def add(self, x, y):
+        self.x.append(float(x))
+        self.y.append(float(y))
+
+    def fit(self):
+        if len(self.x) < 80:
+            return self.a, self.b
+        x = np.array(self.x, dtype=float)
+        y = np.array(self.y, dtype=float)
+        mx = float(x.mean())
+        my = float(y.mean())
+        vx = float(((x - mx) ** 2).mean()) + 1e-12
+        cov = float(((x - mx) * (y - my)).mean())
+        self.b = cov / vx
+        self.a = my - self.b * mx
+        return self.a, self.b
+
+class RollingRidge4:
+    # pack ~ b0 + b1*etf + b2*etf^2 + b3*rv
+    def __init__(self, window=700, ridge=5e-2):
+        self.X = deque(maxlen=window)
+        self.y = deque(maxlen=window)
+        self.ridge = ridge
+        self.beta = np.zeros(4)
+
+    def add(self, etf: float, rv: float, pack: float):
+        if np.isnan(rv):
+            return
+        self.X.append(np.array([1.0, etf, etf * etf, rv], dtype=float))
+        self.y.append(float(pack))
+
+    def fit(self):
+        if len(self.y) < 120:
+            return self.beta
+        X = np.vstack(self.X)
+        y = np.array(self.y)
+        XtX = X.T @ X
+        Xty = X.T @ y
+        lam = self.ridge * np.eye(4)
+        self.beta = np.linalg.solve(XtX + lam, Xty)
+        return self.beta
+
+    def predict(self, etf: float, rv: float) -> float:
+        x = np.array([1.0, etf, etf * etf, rv], dtype=float)
+        return float(x @ self.beta)
+
+    def dprice_detf(self, etf: float) -> float:
+        return float(self.beta[1] + 2.0 * self.beta[2] * etf)
+
+class RollingRidge3:
+    # y ~ b0 + b1*x + b2*rv
+    def __init__(self, window=650, ridge=5e-2):
+        self.X = deque(maxlen=window)
+        self.y = deque(maxlen=window)
+        self.ridge = ridge
+        self.beta = np.zeros(3)
+
+    def add(self, x: float, rv: float, y: float):
+        if np.isnan(rv):
+            return
+        self.X.append(np.array([1.0, x, rv], dtype=float))
+        self.y.append(float(y))
+
+    def fit(self):
+        if len(self.y) < 120:
+            return self.beta
+        X = np.vstack(self.X)
+        y = np.array(self.y)
+        XtX = X.T @ X
+        Xty = X.T @ y
+        lam = self.ridge * np.eye(3)
+        self.beta = np.linalg.solve(XtX + lam, Xty)
+        return self.beta
+
+    def predict(self, x: float, rv: float) -> float:
+        v = np.array([1.0, x, rv], dtype=float)
+        return float(v @ self.beta)
+
+    def dy_dx(self) -> float:
+        return float(self.beta[1])
+
+
+# ============================================================
+# META LAYER: "arb the arb" risk scaler
+# ============================================================
+class MetaRisk:
+    """
+    Very aggressive:
+    - High score => increase size & caps
+    - Low score => throttle to avoid chop
+    """
+    def __init__(self, n=300):
+        self.score_hist = deque(maxlen=n)
+
+    def update(self, score: float):
+        if np.isnan(score):
+            return 0.0
+        self.score_hist.append(float(score))
+        if len(self.score_hist) < 60:
+            return 0.5
+        arr = np.array(self.score_hist, dtype=float)
+        # percentile rank as "crowding/inefficiency"
+        rank = float((arr < score).mean())
+        return rank  # 0..1
+
+    def scale(self, rank: float):
+        # ultra aggressive convex scaling
+        # 0.0 -> 0.3x, 0.5 -> 1.0x, 1.0 -> 2.0x
+        return float(0.3 + 1.7 * (rank ** 1.7))
+
+
+# ============================================================
+# Strategy blocks (aggressive versions)
+# ============================================================
+class SpreadMaker:
+    def __init__(self, api, product, base_max_pos=20, base_qty=3, min_spread=25.0, inside=0.18, cooldown=0.12):
+        self.api = api
+        self.product = product
+        self.base_max_pos = base_max_pos
+        self.base_qty = base_qty
+        self.min_spread = min_spread
+        self.inside = inside
+        self.cooldown = cooldown
+        self.last = 0.0
+
+        self.spread_ma = EWMA(alpha=0.08)
+
+    def step(self, scale=1.0):
+        bid, ask = self.api.get_best_bid_ask(self.product)
+        sp = float(ask - bid)
+        self.spread_ma.update(sp)
+
+        now = time.time()
+        if now - self.last < self.cooldown:
+            return 0.0
+
+        if sp < self.min_spread:
+            return sp
+
+        max_pos = int(self.base_max_pos * scale)
+        qty = int(max(1, round(self.base_qty * scale)))
+
+        pos = int(self.api.get_position(self.product))
+        room_buy = max(0, max_pos - pos)
+        room_sell = max(0, max_pos + pos)
+
+        mid = 0.5 * (bid + ask)
+        buy_px = bid + sp * self.inside
+        sell_px = ask - sp * self.inside
+
+        # inventory skew: if long, sell closer; if short, buy closer
+        skew = (pos / max(1, max_pos)) * (sp * 0.12)
+        buy_px -= skew
+        sell_px -= skew
+
+        buy_px = min(buy_px, mid - 1e-6)
+        sell_px = max(sell_px, mid + 1e-6)
+
+        if room_buy > 0:
+            q = int(min(qty, room_buy))
+            self.api.place_order(self.product, "BUY", float(buy_px), q)
+
+        if room_sell > 0:
+            q = int(min(qty, room_sell))
+            self.api.place_order(self.product, "SELL", float(sell_px), q)
+
+        self.last = now
+        return sp
+
+
+class ETFPackAggArb:
+    def __init__(self, api, etf, pack, base_max_pack=22, base_max_etf=45, base_clip_pack=4, base_clip_etf=10,
+                 z_enter=1.9, z_exit=0.35, cooldown=0.10):
+        self.api = api
+        self.etf = etf
+        self.pack = pack
+
+        self.base_max_pack = base_max_pack
+        self.base_max_etf = base_max_etf
+        self.base_clip_pack = base_clip_pack
+        self.base_clip_etf = base_clip_etf
+
+        self.z_enter = z_enter
+        self.z_exit = z_exit
+        self.cooldown = cooldown
+        self.last = 0.0
+
+        self.rv = RollingRV(n=120)
+        self.reg = RollingRidge4(window=800, ridge=4e-2)
+        self.rz = RollingZ(n=400)
+        self.resid_std = RollingStd(n=280)
+
+    def step(self, scale=1.0):
+        etf_mid = self.api.get_mid(self.etf)
+        pack_mid = self.api.get_mid(self.pack)
+        bid_p, ask_p = self.api.get_best_bid_ask(self.pack)
+        bid_e, ask_e = self.api.get_best_bid_ask(self.etf)
+
+        rv = self.rv.update(etf_mid)
+        self.reg.add(etf_mid, rv, pack_mid)
+        self.reg.fit()
+        fair = self.reg.predict(etf_mid, rv)
+
+        resid = float(pack_mid - fair)
+        self.rz.add(resid)
+        self.resid_std.add(resid)
+        z = self.rz.z(resid)
+
+        now = time.time()
+        if now - self.last < self.cooldown:
+            return resid, z
+
+        max_pack = int(self.base_max_pack * scale)
+        max_etf = int(self.base_max_etf * scale)
+        clip_pack = int(max(1, round(self.base_clip_pack * scale)))
+        clip_etf = int(max(1, round(self.base_clip_etf * scale)))
+
+        pack_pos = int(self.api.get_position(self.pack))
+        etf_pos = int(self.api.get_position(self.etf))
+
+        # exit fast
+        if (not np.isnan(z)) and abs(z) < self.z_exit and (pack_pos != 0 or etf_pos != 0):
+            # flatten in chunks
+            if pack_pos > 0:
+                q = min(pack_pos, clip_pack); self.api.place_order(self.pack, "SELL", bid_p, q)
+            if pack_pos < 0:
+                q = min(-pack_pos, clip_pack); self.api.place_order(self.pack, "BUY", ask_p, q)
+            if etf_pos > 0:
+                q = min(etf_pos, clip_etf); self.api.place_order(self.etf, "SELL", bid_e, q)
+            if etf_pos < 0:
+                q = min(-etf_pos, clip_etf); self.api.place_order(self.etf, "BUY", ask_e, q)
+
+            self.last = now
+            return resid, z
+
+        if np.isnan(z):
+            return resid, z
+
+        dP_dE = self.reg.dprice_detf(etf_mid)
+
+        # pack rich => SELL pack + BUY etf hedge
+        if z > self.z_enter:
+            room_sell = max_pack + pack_pos
+            if room_sell > 0:
+                q = int(min(clip_pack, room_sell))
+                self.api.place_order(self.pack, "SELL", bid_p, q)
+
+                hedge = int(np.clip(dP_dE * q, -clip_etf, clip_etf))
+                room_buy = max_etf - etf_pos
+                room_sell_e = max_etf + etf_pos
+
+                if hedge > 0 and room_buy > 0:
+                    self.api.place_order(self.etf, "BUY", ask_e, int(min(hedge, room_buy)))
+                if hedge < 0 and room_sell_e > 0:
+                    self.api.place_order(self.etf, "SELL", bid_e, int(min(-hedge, room_sell_e)))
+
+                self.last = now
+
+        # pack cheap => BUY pack + SELL etf hedge
+        if z < -self.z_enter:
+            room_buy_p = max_pack - pack_pos
+            if room_buy_p > 0:
+                q = int(min(clip_pack, room_buy_p))
+                self.api.place_order(self.pack, "BUY", ask_p, q)
+
+                hedge = int(np.clip(dP_dE * q, -clip_etf, clip_etf))
+                room_buy = max_etf - etf_pos
+                room_sell_e = max_etf + etf_pos
+
+                if hedge > 0 and room_sell_e > 0:
+                    self.api.place_order(self.etf, "SELL", bid_e, int(min(hedge, room_sell_e)))
+                if hedge < 0 and room_buy > 0:
+                    self.api.place_order(self.etf, "BUY", ask_e, int(min(-hedge, room_buy)))
+
+                self.last = now
+
+        return resid, z
+
+
+class PairTradeAgg:
+    # pB ~ a + b*pA
+    def __init__(self, api, pA, pB, base_maxA=90, base_maxB=90, base_clipA=14, base_clipB=14,
+                 z_enter=1.9, z_exit=0.35, cooldown=0.10):
+        self.api = api
+        self.pA = pA
+        self.pB = pB
+
+        self.base_maxA = base_maxA
+        self.base_maxB = base_maxB
+        self.base_clipA = base_clipA
+        self.base_clipB = base_clipB
+
+        self.z_enter = z_enter
+        self.z_exit = z_exit
+        self.cooldown = cooldown
+        self.last = 0.0
+
+        self.ols = RollingOLS2(window=700)
+        self.rz = RollingZ(n=400)
+        self.resid_std = RollingStd(n=280)
+
+    def step(self, scale=1.0):
+        A = self.api.get_mid(self.pA)
+        B = self.api.get_mid(self.pB)
+        bidA, askA = self.api.get_best_bid_ask(self.pA)
+        bidB, askB = self.api.get_best_bid_ask(self.pB)
+
+        self.ols.add(A, B)
+        a, b = self.ols.fit()
+
+        fairB = a + b * A
+        resid = float(B - fairB)
+        self.rz.add(resid)
+        self.resid_std.add(resid)
+        z = self.rz.z(resid)
+
+        now = time.time()
+        if now - self.last < self.cooldown:
+            return resid, z
+
+        maxA = int(self.base_maxA * scale)
+        maxB = int(self.base_maxB * scale)
+        clipA = int(max(1, round(self.base_clipA * scale)))
+        clipB = int(max(1, round(self.base_clipB * scale)))
+
+        posA = int(self.api.get_position(self.pA))
+        posB = int(self.api.get_position(self.pB))
+
+        if (not np.isnan(z)) and abs(z) < self.z_exit and (posA != 0 or posB != 0):
+            if posB > 0:
+                q = min(posB, clipB); self.api.place_order(self.pB, "SELL", bidB, q)
+            if posB < 0:
+                q = min(-posB, clipB); self.api.place_order(self.pB, "BUY", askB, q)
+            if posA > 0:
+                q = min(posA, clipA); self.api.place_order(self.pA, "SELL", bidA, q)
+            if posA < 0:
+                q = min(-posA, clipA); self.api.place_order(self.pA, "BUY", askA, q)
+
+            self.last = now
+            return resid, z
+
+        if np.isnan(z):
+            return resid, z
+
+        hedgeA = int(np.clip(b, -clipA, clipA))
+        hedgeA = hedgeA if hedgeA != 0 else 1
+
+        # B rich => SELL B, BUY A
+        if z > self.z_enter:
+            room_sellB = maxB + posB
+            room_buyA = maxA - posA
+            if room_sellB > 0 and room_buyA > 0:
+                qB = int(min(clipB, room_sellB))
+                self.api.place_order(self.pB, "SELL", bidB, qB)
+
+                qA = int(min(clipA, room_buyA, abs(hedgeA) * qB))
+                if qA > 0:
+                    self.api.place_order(self.pA, "BUY", askA, qA)
+
+                self.last = now
+
+        # B cheap => BUY B, SELL A
+        if z < -self.z_enter:
+            room_buyB = maxB - posB
+            room_sellA = maxA + posA
+            if room_buyB > 0 and room_sellA > 0:
+                qB = int(min(clipB, room_buyB))
+                self.api.place_order(self.pB, "BUY", askB, qB)
+
+                qA = int(min(clipA, room_sellA, abs(hedgeA) * qB))
+                if qA > 0:
+                    self.api.place_order(self.pA, "SELL", bidA, qA)
+
+                self.last = now
+
+        return resid, z
+
+
+class M2vsM1AggArbUpBias:
+    # Keep relationship arb, but bias to NOT fight M1-up regime:
+    # - we only take the "SELL M2 + BUY M1" direction when M2 rich vs model.
+    def __init__(self, api, m1, m2, base_max1=140, base_max2=40, base_clip1=18, base_clip2=6,
+                 z_enter=1.8, z_exit=0.35, cooldown=0.10, m1_floor=0):
+        self.api = api
+        self.m1 = m1
+        self.m2 = m2
+
+        self.base_max1 = base_max1
+        self.base_max2 = base_max2
+        self.base_clip1 = base_clip1
+        self.base_clip2 = base_clip2
+
+        self.z_enter = z_enter
+        self.z_exit = z_exit
+        self.cooldown = cooldown
+        self.last = 0.0
+
+        self.m1_floor = m1_floor
+
+        self.rv = RollingRV(n=120)
+        self.reg = RollingRidge3(window=700, ridge=4e-2)
+        self.rz = RollingZ(n=400)
+        self.resid_std = RollingStd(n=280)
+
+    def step(self, scale=1.0):
+        m1 = self.api.get_mid(self.m1)
+        m2 = self.api.get_mid(self.m2)
+        bid1, ask1 = self.api.get_best_bid_ask(self.m1)
+        bid2, ask2 = self.api.get_best_bid_ask(self.m2)
+
+        rv = self.rv.update(m1)
+        self.reg.add(m1, rv, m2)
+        self.reg.fit()
+        fair2 = self.reg.predict(m1, rv)
+
+        resid = float(m2 - fair2)
+        self.rz.add(resid)
+        self.resid_std.add(resid)
+        z = self.rz.z(resid)
+
+        now = time.time()
+        if now - self.last < self.cooldown:
+            return resid, z
+
+        max1 = int(self.base_max1 * scale)
+        max2 = int(self.base_max2 * scale)
+        clip1 = int(max(1, round(self.base_clip1 * scale)))
+        clip2 = int(max(1, round(self.base_clip2 * scale)))
+
+        pos1 = int(self.api.get_position(self.m1))
+        pos2 = int(self.api.get_position(self.m2))
+
+        if (not np.isnan(z)) and abs(z) < self.z_exit and (pos2 != 0 or pos1 != self.m1_floor):
+            # flatten M2; reduce M1 only down to floor
+            if pos2 > 0:
+                q = min(pos2, clip2); self.api.place_order(self.m2, "SELL", bid2, q)
+            if pos2 < 0:
+                q = min(-pos2, clip2); self.api.place_order(self.m2, "BUY", ask2, q)
+            if pos1 > self.m1_floor:
+                q = min(pos1 - self.m1_floor, clip1); self.api.place_order(self.m1, "SELL", bid1, q)
+
+            self.last = now
+            return resid, z
+
+        if np.isnan(z):
+            return resid, z
+
+        beta = self.reg.dy_dx()
+
+        # only trade when M2 is rich (z high): SELL M2 + BUY M1
+        if z > self.z_enter:
+            room_sell2 = max2 + pos2
+            room_buy1 = max1 - pos1
+            if room_sell2 > 0:
+                q2 = int(min(clip2, room_sell2))
+                self.api.place_order(self.m2, "SELL", bid2, q2)
+
+                hedge = int(np.clip(beta * q2, 0, clip1))  # clamp >=0 => BUY M1 only
+                q1 = int(min(hedge, room_buy1))
+                if q1 > 0:
+                    self.api.place_order(self.m1, "BUY", ask1, q1)
+
+                self.last = now
+
+        return resid, z
+
+
+class UpOnlyDipBuyer:
+    def __init__(self, api, product, base_max=120, base_clip=18, z_enter=1.2, z_take=0.2, cooldown=0.08):
+        self.api = api
+        self.product = product
+        self.base_max = base_max
+        self.base_clip = base_clip
+        self.z_enter = z_enter
+        self.z_take = z_take
+        self.cooldown = cooldown
+        self.last = 0.0
+        self.ema = EWMA(alpha=0.07)
+        self.dev = RollingStd(n=220)
+
+    def step(self, scale=1.0):
+        mid = self.api.get_mid(self.product)
+        bid, ask = self.api.get_best_bid_ask(self.product)
+        pos = int(self.api.get_position(self.product))
+
+        mu = self.ema.update(mid)
+        d = float(mid - mu)
+        self.dev.add(d)
+        sd = self.dev.std()
+        z = d / (sd if not np.isnan(sd) else np.nan)
+
+        now = time.time()
+        if now - self.last < self.cooldown:
+            return d, z
+
+        max_pos = int(self.base_max * scale)
+        clip = int(max(1, round(self.base_clip * scale)))
+
+        # buy dips
+        if (not np.isnan(z)) and z < -self.z_enter:
+            room = max_pos - pos
+            if room > 0:
+                q = int(min(clip, room))
+                self.api.place_order(self.product, "BUY", ask, q)
+                self.last = now
+
+        # take profit on revert (never short)
+        if (not np.isnan(z)) and z > -self.z_take and pos > 0:
+            q = int(min(clip, pos))
+            self.api.place_order(self.product, "SELL", bid, q)
+            self.last = now
+
+        return d, z
+
+
+# ============================================================
+# MAIN: extremely risk-taking arb-the-arb across all markets
+# ============================================================
+def run_extreme_meta_arb(api: ExchangeAPI):
+    # ---- SET YOUR TICKERS HERE ----
+    # 7/8
+    ETF7 = "LON_ETF"
+    PACK8 = "ETF_PACK_8"
+
+    # 1/2/3/4
+    M1 = "TIDE_SPOT"
+    M2 = "TIDE_SWING"
+    M3 = "WX_SUM"
+    M4 = "WX_SPOT"
+
+    # 5/6
+    M5 = "LHR_COUNT"
+    M6 = "LON_FLY"
+
+    # ---- instantiate ----
+    meta = MetaRisk(n=320)
+
+    # Strategy blocks
+    mm8 = SpreadMaker(api, PACK8, base_max_pos=26, base_qty=4, min_spread=22.0, inside=0.18, cooldown=0.10)
+    arb78 = ETFPackAggArb(api, etf=ETF7, pack=PACK8, z_enter=1.9, z_exit=0.35, cooldown=0.10)
+    arb12 = M2vsM1AggArbUpBias(api, m1=M1, m2=M2, z_enter=1.8, z_exit=0.35, cooldown=0.10, m1_floor=0)
+    pair56 = PairTradeAgg(api, pA=M5, pB=M6, z_enter=1.9, z_exit=0.35, cooldown=0.10)
+    dip1 = UpOnlyDipBuyer(api, M1, z_enter=1.2, z_take=0.2, cooldown=0.08)
+    dip3 = UpOnlyDipBuyer(api, M3, z_enter=1.2, z_take=0.2, cooldown=0.08)
+    dip4 = UpOnlyDipBuyer(api, M4, z_enter=1.2, z_take=0.2, cooldown=0.08)
+
+    # Local score components (inefficiency proxies)
+    # We'll compute one composite score dominated by:
+    # - Market 8 spread
+    # - residual volatility (78 and 12 and 56)
+    score_hist = RollingStd(n=260)
+
+    while True:
+        # ---- Step 1: measure inefficiency / "room to arb" ----
+        # 8 spread
+        bid8, ask8 = api.get_best_bid_ask(PACK8)
+        sp8 = float(ask8 - bid8)
+
+        # 7/8 residual
+        resid78, z78 = arb78.step(scale=0.0)  # scale=0 means "just compute" is not supported, so we call later again
+        # We'll compute residual again properly by calling with scale=1, but we need score first.
+        # Hack: use spread + recent sd only for score now.
+
+        score = float(sp8)
+        score_hist.add(score)
+        rank = meta.update(score_hist.std() * (score_hist.mean() if not np.isnan(score_hist.mean()) else score))
+        scale = meta.scale(rank)
+
+        # ---- Step 2: deploy risk where edge exists (extreme sizing) ----
+        # Market 8: spread maker prints micro-edge when spread wide
+        mm8.step(scale=scale)
+
+        # 7/8: stat arb (rich/cheap pack vs fair)
+        arb78.step(scale=scale)
+
+        # 1/2: relationship arb but biased to BUY M1 only
+        arb12.step(scale=scale)
+
+        # 5/6: stable relationship pair trading
+        pair56.step(scale=scale)
+
+        # 1/3/4: up-only dip buying (still “arb” around mean, but long-biased)
+        dip1.step(scale=scale)
+        dip3.step(scale=scale)
+        dip4.step(scale=scale)
+
+        time.sleep(0.08)
