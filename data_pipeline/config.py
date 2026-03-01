@@ -9,10 +9,15 @@ from urllib3.util.retry import Retry
 _env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(_env_path)
 
-# .env uses RAPID_API_KEY (with underscore); returns None if not set
-RAPIDAPI_KEY = os.environ.get("RAPID_API_KEY")
+# ---------------------------------------------------------------------------
+# Heathrow PIHub API (official Heathrow Airport data platform)
+# ---------------------------------------------------------------------------
+# Set PIHUB_API_KEY in your .env file if the PIHub endpoint requires auth.
+# Leave blank / omit if the endpoint is publicly accessible.
+PIHUB_API_KEY: str | None = os.environ.get("PIHUB_API_KEY")
 
-RAPIDAPI_HOST = "aerodatabox.p.rapidapi.com"
+# Base URL for PIHub REST endpoints (arrivals / departures appended by fetcher)
+PIHUB_BASE_URL = "https://api-dp-prod.dp.heathrow.com/pihub/flights"
 
 # --- London coordinates (fixed, do not change) ---
 LONDON_LAT = 51.5074
@@ -32,7 +37,7 @@ RETRY_BACKOFF = 2.0     # seconds; multiplied by attempt number on each retry
 THAMES_CACHE_TTL = 240
 # Open-Meteo updates its model every ~15 min — cache for 10 min
 WEATHER_CACHE_TTL = 600
-# Flights update continuously — cache for 10 min to massively save on RapidAPI limit
+# Flights update continuously — cache for 10 min to avoid hammering PIHub
 FLIGHTS_CACHE_TTL = 600
 
 # --- Global HTTP Session with auto-retries ---

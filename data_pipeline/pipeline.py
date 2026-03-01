@@ -50,7 +50,7 @@ from .settlement import (
     compute_lon_fly,
 )
 from .config import (
-    RAPIDAPI_KEY,
+    PIHUB_API_KEY,
     THAMES_CACHE_TTL,
     WEATHER_CACHE_TTL,
     FLIGHTS_CACHE_TTL,
@@ -180,12 +180,17 @@ class DataPipeline:
     ):
         self.window_start = window_start
         self.window_end   = window_end
-        self.skip_flights = skip_flights or not RAPIDAPI_KEY
+        # Auto-skip flights only when the caller explicitly requests it.
+        # PIHub may be a public endpoint; if auth IS required and the key is
+        # absent the fetcher will raise a RuntimeError at fetch time with a
+        # clear message rather than silently skipping.
+        self.skip_flights = skip_flights
 
         if self.skip_flights:
             log.warning(
-                "Flights data disabled — set RAPIDAPI_KEY in config.py to enable "
-                "Markets 5 (LHR_COUNT), 6 (LHR_INDEX), and the ETF components."
+                "Flights data disabled — set skip_flights=False (default) to enable "
+                "Markets 5 (LHR_COUNT), 6 (LHR_INDEX), and the ETF components. "
+                "If PIHub requires auth, set PIHUB_API_KEY in your .env file."
             )
 
         self._cache = _TTLCache()

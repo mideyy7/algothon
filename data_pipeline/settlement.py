@@ -37,7 +37,7 @@ class MarketEstimates:
     """Current best estimates for all 8 market settlement values.
 
     Fields are None if the underlying data has not been fetched yet
-    (e.g., flights are None until RAPIDAPI_KEY is configured).
+    (e.g., flights are None if skip_flights=True or PIHub is unreachable).
 
     Attributes:
         m1_tide_spot:  Market 1 — TIDE_SPOT
