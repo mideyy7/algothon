@@ -1,0 +1,290 @@
+from collections import deque
+import numpy as np
+import time
+
+# -------------------------
+# Small rolling helpers
+# -------------------------
+class RollingStd:
+    def __init__(self, n=200):
+        self.x = deque(maxlen=n)
+
+    def add(self, v: float):
+        self.x.append(float(v))
+
+    def mean(self):
+        return float(np.mean(self.x)) if len(self.x) else np.nan
+
+    def std(self):
+        if len(self.x) < 30:
+            return np.nan
+        return float(np.std(self.x) + 1e-9)
+
+class EWMA1:
+    def __init__(self, alpha=0.06):
+        self.alpha = alpha
+        self.v = None
+
+    def update(self, x: float) -> float:
+        x = float(x)
+        self.v = x if self.v is None else (1 - self.alpha) * self.v + self.alpha * x
+        return self.v
+
+class RollingRV1:
+    def __init__(self, n=120):
+        self.px = deque(maxlen=n + 1)
+
+    def update(self, p: float) -> float:
+        self.px.append(float(p))
+        if len(self.px) < 25:
+            return np.nan
+        r = np.diff(np.log(np.array(self.px)))
+        return float(np.sqrt(np.mean(r * r)))
+
+class RollingRidge3:
+    # y ~ b0 + b1*x + b2*rv
+    def __init__(self, window=600, ridge=5e-2):
+        self.X = deque(maxlen=window)
+        self.y = deque(maxlen=window)
+        self.ridge = ridge
+        self.beta = np.zeros(3)
+
+    def add(self, x: float, rv: float, y: float):
+        if np.isnan(rv):
+            return
+        self.X.append(np.array([1.0, x, rv], dtype=float))
+        self.y.append(float(y))
+
+    def fit(self):
+        if len(self.y) < 120:
+            return self.beta
+        X = np.vstack(self.X)
+        y = np.array(self.y)
+        XtX = X.T @ X
+        Xty = X.T @ y
+        lam = self.ridge * np.eye(3)
+        self.beta = np.linalg.solve(XtX + lam, Xty)
+        return self.beta
+
+    def predict(self, x: float, rv: float) -> float:
+        v = np.array([1.0, x, rv], dtype=float)
+        return float(v @ self.beta)
+
+    def dy_dx(self) -> float:
+        return float(self.beta[1])
+
+# -------------------------
+# Market 2 stat arb vs Market 1
+# -------------------------
+class M2vsM1StatArb:
+    def __init__(
+        self,
+        api,
+        m1="TIDE_SPOT",
+        m2="TIDE_SWING",
+        max_m2_pos=25,
+        max_m1_pos=60,
+        clip_m2=4,
+        clip_m1=8,
+        z_enter=2.3,
+        z_exit=0.6,
+        cooldown=0.2,
+    ):
+        self.api = api
+        self.m1 = m1
+        self.m2 = m2
+
+        self.max_m2_pos = max_m2_pos
+        self.max_m1_pos = max_m1_pos
+        self.clip_m2 = clip_m2
+        self.clip_m1 = clip_m1
+
+        self.z_enter = z_enter
+        self.z_exit = z_exit
+        self.cooldown = cooldown
+        self.last_trade = 0.0
+
+        self.rv1 = RollingRV1(n=120)
+        self.reg = RollingRidge3(window=650, ridge=5e-2)
+        self.res = RollingStd(n=350)
+
+    def flatten(self, clip=10):
+        for p in [self.m2, self.m1]:
+            pos = self.api.get_position(p)
+            if pos == 0:
+                continue
+            bid, ask = self.api.get_best_bid_ask(p)
+            q = int(min(abs(pos), clip))
+            if pos > 0:
+                self.api.place_order(p, "SELL", bid, q)
+            if pos < 0:
+                self.api.place_order(p, "BUY", ask, q)
+
+    def step(self):
+        m1 = self.api.get_mid(self.m1)
+        m2 = self.api.get_mid(self.m2)
+        bid1, ask1 = self.api.get_best_bid_ask(self.m1)
+        bid2, ask2 = self.api.get_best_bid_ask(self.m2)
+
+        rv = self.rv1.update(m1)
+
+        self.reg.add(m1, rv, m2)
+        self.reg.fit()
+
+        fair = self.reg.predict(m1, rv)
+        resid = m2 - fair
+        self.res.add(resid)
+
+        mu = self.res.mean()
+        sd = self.res.std()
+        z = (resid - mu) / (sd if not np.isnan(sd) else np.nan)
+
+        pos2 = self.api.get_position(self.m2)
+        pos1 = self.api.get_position(self.m1)
+
+        now = time.time()
+        if now - self.last_trade < self.cooldown:
+            return {"act": "COOLDOWN", "z": z, "resid": resid, "fair": fair}
+
+        # Exit when normalized: flatten both legs
+        if (not np.isnan(z)) and abs(z) < self.z_exit and (pos2 != 0 or pos1 != 0):
+            self.flatten(clip=10)
+            self.last_trade = now
+            return {"act": "FLATTEN_EXIT", "z": z, "resid": resid, "fair": fair}
+
+        if np.isnan(z):
+            return {"act": "WARMUP", "z": z, "resid": resid, "fair": fair}
+
+        beta = self.reg.dy_dx()  # hedge ratio approx
+
+        # z high => M2 rich => SELL M2, BUY beta*M1
+        if z > self.z_enter:
+            room_sell2 = max(0, self.max_m2_pos + pos2)
+            if room_sell2 > 0:
+                q2 = int(min(self.clip_m2, room_sell2))
+                self.api.place_order(self.m2, "SELL", bid2, q2)
+
+                hedge = int(np.clip(beta * q2, -self.clip_m1, self.clip_m1))
+                room_buy1 = max(0, self.max_m1_pos - pos1)
+                room_sell1 = max(0, self.max_m1_pos + pos1)
+
+                if hedge > 0 and room_buy1 > 0:
+                    self.api.place_order(self.m1, "BUY", ask1, int(min(hedge, room_buy1)))
+                if hedge < 0 and room_sell1 > 0:
+                    self.api.place_order(self.m1, "SELL", bid1, int(min(-hedge, room_sell1)))
+
+                self.last_trade = now
+                return {"act": f"SELL_M2 {q2} HEDGE {hedge}", "z": z, "beta": beta}
+
+        # z low => M2 cheap => BUY M2, SELL beta*M1
+        if z < -self.z_enter:
+            room_buy2 = max(0, self.max_m2_pos - pos2)
+            if room_buy2 > 0:
+                q2 = int(min(self.clip_m2, room_buy2))
+                self.api.place_order(self.m2, "BUY", ask2, q2)
+
+                hedge = int(np.clip(beta * q2, -self.clip_m1, self.clip_m1))
+                room_buy1 = max(0, self.max_m1_pos - pos1)
+                room_sell1 = max(0, self.max_m1_pos + pos1)
+
+                if hedge > 0 and room_sell1 > 0:
+                    self.api.place_order(self.m1, "SELL", bid1, int(min(hedge, room_sell1)))
+                if hedge < 0 and room_buy1 > 0:
+                    self.api.place_order(self.m1, "BUY", ask1, int(min(-hedge, room_buy1)))
+
+                self.last_trade = now
+                return {"act": f"BUY_M2 {q2} HEDGE {hedge}", "z": z, "beta": beta}
+
+        return {"act": "HOLD", "z": z, "resid": resid, "fair": fair}
+
+# -------------------------
+# Upward dip-buyer (mean reversion around EWMA)
+# -------------------------
+class UpDipBuyer:
+    def __init__(self, api, product, max_pos=50, clip=8, z_enter=1.6, z_take=0.3, cooldown=0.2):
+        self.api = api
+        self.product = product
+        self.max_pos = max_pos
+        self.clip = clip
+        self.z_enter = z_enter
+        self.z_take = z_take
+        self.cooldown = cooldown
+        self.last_trade = 0.0
+        self.ema = EWMA1(alpha=0.06)
+        self.dev = RollingStd(n=220)
+
+    def step(self):
+        mid = self.api.get_mid(self.product)
+        bid, ask = self.api.get_best_bid_ask(self.product)
+        pos = self.api.get_position(self.product)
+
+        m = self.ema.update(mid)
+        d = mid - m
+        self.dev.add(d)
+        sd = self.dev.std()
+        z = d / (sd if not np.isnan(sd) else np.nan)
+
+        now = time.time()
+        if now - self.last_trade < self.cooldown:
+            return {"p": self.product, "act": "COOLDOWN", "z": z}
+
+        # Buy dips (mid << ema)
+        if not np.isnan(z) and z < -self.z_enter:
+            room_buy = max(0, self.max_pos - pos)
+            if room_buy > 0:
+                q = int(min(self.clip, room_buy))
+                self.api.place_order(self.product, "BUY", ask, q)
+                self.last_trade = now
+                return {"p": self.product, "act": f"BUY {q}", "z": z}
+
+        # Take profit / reduce when reverted (mid >= ema)
+        if not np.isnan(z) and z > -self.z_take and pos > 0:
+            q = int(min(self.clip, pos))
+            self.api.place_order(self.product, "SELL", bid, q)
+            self.last_trade = now
+            return {"p": self.product, "act": f"TAKE {q}", "z": z}
+
+        return {"p": self.product, "act": "HOLD", "z": z}
+
+# -------------------------
+# Runner for markets 1-6 only
+# -------------------------
+def run_markets_1_6(api: ExchangeAPI):
+    # >>> ADJUST THESE SYMBOLS to your platform mapping <<<
+    M1 = "TIDE_SPOT"     # Market 1 Thames
+    M2 = "TIDE_SWING"    # Market 2 derivative on Thames (your strangle/structure)
+    M3 = "WX_SUM"        # Market 3 (temperature-related)
+    M4 = "WX_SPOT"       # Market 4 (humidity-related) OR change to your true Market 4
+    # Market 5/6: add if you want (same UpDipBuyer template)
+
+    # 1) Stat arb: Market2 vs Market1
+    arb_21 = M2vsM1StatArb(
+        api=api,
+        m1=M1,
+        m2=M2,
+        max_m2_pos=25,
+        max_m1_pos=70,
+        clip_m2=4,
+        clip_m1=10,
+        z_enter=2.3,
+        z_exit=0.6,
+        cooldown=0.2,
+    )
+
+    # 2) Upward pullback entries for 1/3/4
+    dip_buyers = [
+        UpDipBuyer(api, M1, max_pos=80, clip=12, z_enter=1.6, z_take=0.3, cooldown=0.2),
+        UpDipBuyer(api, M3, max_pos=45, clip=8,  z_enter=1.6, z_take=0.3, cooldown=0.2),
+        UpDipBuyer(api, M4, max_pos=45, clip=8,  z_enter=1.6, z_take=0.3, cooldown=0.2),
+    ]
+
+    # optional: flatten only these before starting
+    for _ in range(5):
+        flatten_all(api, [M1, M2, M3, M4], clip=15)
+        time.sleep(0.2)
+
+    while True:
+        arb_21.step()
+        for b in dip_buyers:
+            b.step()
+        time.sleep(0.15)
