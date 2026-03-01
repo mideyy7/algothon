@@ -41,7 +41,17 @@ if _ROOT not in sys.path:
 from imc_template.bot_template import BaseBot, OrderBook, OrderRequest, Trade, Side
 from data_pipeline import DataPipeline, get_market_window
 from quant_models import fill_missing_estimates
-from stat_arb import BotExchangeAdapter, VolatileOptionArb, ETFPackageImpliedVolArb, ETFBasketArb, BBO, RegimeDirectional
+from stat_arb import (
+    BotExchangeAdapter, BBO,
+    # Identity arb (M7 basket)
+    ETFBasketArb,
+    # Regression-based stat arb (new algos)
+    ETFPackStatArb, M2vsM1StatArb, UpDipBuyer,
+    # Trend capture (LHR_COUNT only)
+    RegimeDirectional,
+    # Kept for potential future use / backward compat
+    VolatileOptionArb, ETFPackageImpliedVolArb,
+)
 
 # ── Risk framework ─────────────────────────────────────────────────────────
 _RISK_AVAILABLE = False
@@ -123,15 +133,34 @@ class IMCBot(BaseBot):
         # Adapter bridges arb strategies to this bot's order/position methods.
         self._exchange_adapter = BotExchangeAdapter(self)
 
-        # Strategy A: TIDE_SWING mean-reversion (Market 2)
-        self._tide_swing_arb = VolatileOptionArb(
+        # Strategy A: TIDE_SWING vs TIDE_SPOT rolling ridge stat arb (Markets 1 & 2)
+        # Replaces VolatileOptionArb — uses regression fair-value + z-score.
+        self._m2_vs_m1_arb = M2vsM1StatArb(
             api=self._exchange_adapter,
-            product="TIDE_SWING",
+            m1="TIDE_SPOT",
+            m2="TIDE_SWING",
+            max_m2_pos=25,
+            max_m1_pos=70,
+            clip_m2=4,
+            clip_m1=10,
+            z_enter=2.3,
+            z_exit=0.6,
+            cooldown=0.2,
         )
 
-        # Strategy B: LON_ETF vs LON_FLY Implied Vol arb (Markets 7 & 8)
-        self._etf_package_arb = ETFPackageImpliedVolArb(
+        # Strategy B: LON_ETF vs LON_FLY rolling ridge stat arb (Markets 7 & 8)
+        # Replaces ETFPackageImpliedVolArb — regression approach, no MC bisection.
+        self._etf_pack_stat_arb = ETFPackStatArb(
             api=self._exchange_adapter,
+            etf="LON_ETF",
+            pack="LON_FLY",
+            max_pack_pos=18,
+            max_etf_pos=35,
+            clip_pack=3,
+            clip_etf=6,
+            z_enter=2.5,
+            z_exit=0.6,
+            cooldown=0.15,
         )
 
         # Strategy C: LON_ETF vs Basket Identity arb (Markets 1, 3, 5, 7)
@@ -139,14 +168,18 @@ class IMCBot(BaseBot):
             api=self._exchange_adapter,
         )
 
-        # Strategy D: Regime Directional Traders (Trend Capture)
-        # Maximizing size limits and softening edges for extreme aggression
-        self._regime_traders = {
+        # Strategy D: UpDipBuyers — EWMA mean-reversion for Markets 1, 3, 4
+        # Buys sharp dips below the rolling EWMA on tidal + weather products.
+        self._dip_buyers: dict[str, UpDipBuyer] = {
+            "TIDE_SPOT": UpDipBuyer(self._exchange_adapter, "TIDE_SPOT", max_pos=80, clip=12, z_enter=1.6, z_take=0.3, cooldown=0.2),
+            "WX_SUM":    UpDipBuyer(self._exchange_adapter, "WX_SUM",    max_pos=45, clip=8,  z_enter=1.6, z_take=0.3, cooldown=0.2),
+            "WX_SPOT":   UpDipBuyer(self._exchange_adapter, "WX_SPOT",   max_pos=45, clip=8,  z_enter=1.6, z_take=0.3, cooldown=0.2),
+        }
+
+        # Strategy E: Regime Directional (trend capture) — LHR_COUNT only.
+        # TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM are now handled by the new algos above.
+        self._regime_traders: dict[str, RegimeDirectional] = {
             "LHR_COUNT": RegimeDirectional(self._exchange_adapter, "LHR_COUNT", "DOWN", 100, 25, 0.4),
-            "TIDE_SPOT": RegimeDirectional(self._exchange_adapter, "TIDE_SPOT", "DOWN", 100, 25, 0.3),
-            "TIDE_SWING": RegimeDirectional(self._exchange_adapter, "TIDE_SWING", "DOWN", 100, 25, 0.3),
-            "WX_SPOT": RegimeDirectional(self._exchange_adapter, "WX_SPOT", "UP", 100, 25, 0.4),
-            "WX_SUM": RegimeDirectional(self._exchange_adapter, "WX_SUM", "DOWN", 100, 25, 0.4),
         }
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
@@ -203,9 +236,12 @@ class IMCBot(BaseBot):
             self._refresh_fair_values()
 
             # ── MM Skip ────────────────────────────────────────────────────────────
-            # Completely disable passive market making for purely directional assets.
-            # If we don't skip, the stale fundamental prices will force the MM to cleanly 
-            # buy against our structural DOWN trends, causing self-churn and toxic inventory.
+            # Disable passive MM for LHR_COUNT where the RegimeDirectional strategy
+            # takes a purely directional stance — stale fundamental prices would cause
+            # self-churn and toxic inventory build-up.
+            # TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM now use the new mean-reversion
+            # algos (M2vsM1StatArb + UpDipBuyer), which are compatible with MM running
+            # alongside them at the separate per-product throttle cadence.
             if product in self._regime_traders:
                 return
 
@@ -290,33 +326,49 @@ class IMCBot(BaseBot):
 
         Called on EVERY tick (before the MM throttle) so the arb strategies
         see every price update.  Each strategy manages its own cooldown.
+
+        Dispatch logic:
+          TIDE_SWING / TIDE_SPOT → M2vsM1StatArb (regression z-score arb, M1 & 2)
+          TIDE_SPOT / WX_SUM / WX_SPOT → UpDipBuyer (EWMA mean-reversion)
+          LON_ETF / LON_FLY → ETFPackStatArb (regression z-score arb, M7 & 8)
+          LON_ETF / TIDE_SPOT / WX_SPOT / LHR_COUNT → ETFBasketArb (identity arb)
+          LHR_COUNT → RegimeDirectional (trend capture)
         """
         try:
-            # Execute directional regime trader if applicable
-            if product in self._regime_traders:
-                result = self._regime_traders[product].step()
-                action = result.get("action", "")
-                if action not in {"HOLD", "NO_DATA"}:
-                    log.info("Regime %s: %s", product, action)
+            # ── Strategy A: M2vsM1 stat arb fires on tidal product ticks ──
+            if product in ("TIDE_SWING", "TIDE_SPOT"):
+                result = self._m2_vs_m1_arb.step()
+                act = result.get("act", "HOLD")
+                if act not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN"}:
+                    log.info("M2vsM1Arb: %s", act)
 
-            # Keep legacy arb for metrics (optional)
-            if product == "TIDE_SWING" and mid is not None:
-                result = self._tide_swing_arb.step(mid=mid)
-                action = result.get("action", "")
-                if action not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN", "BLOCK_VOL", "NO_VOL"}:
-                    log.info("TideSwingArb: %s", action)
+            # ── Strategy D: UpDipBuyer for individual products ──
+            if product in self._dip_buyers:
+                result = self._dip_buyers[product].step()
+                act = result.get("act", "HOLD")
+                if act not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN"}:
+                    log.info("DipBuyer[%s]: %s", product, act)
 
-            elif product in ("LON_ETF", "LON_FLY"):
-                result = self._etf_package_arb.step()
-                action = result.get("action", "")
-                if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL", "COOLDOWN", "CAPPED"}:
-                    log.info("ETFPackageArb: %s", action)
+            # ── Strategy B: ETFPackStatArb fires on M7 / M8 ticks ──
+            if product in ("LON_ETF", "LON_FLY"):
+                result = self._etf_pack_stat_arb.step()
+                act = result.get("act", "HOLD")
+                if act not in {"HOLD", "WARMUP", "NO_DATA", "COOLDOWN"}:
+                    log.info("ETFPackStatArb: %s", act)
 
+            # ── Strategy C: ETFBasketArb fires on basket-leg ticks ──
             if product in ("LON_ETF", "TIDE_SPOT", "WX_SPOT", "LHR_COUNT"):
                 result = self._etf_basket_arb.step()
-                action = result.get("action", "")
+                action = result.get("action", "HOLD")
                 if action not in {"HOLD", "WARMUP", "NO_DATA", "NO_VOL", "COOLDOWN", "CAPPED"}:
                     log.info("ETFBasketArb: %s", action)
+
+            # ── Strategy E: Regime directional (LHR_COUNT only) ──
+            if product in self._regime_traders:
+                result = self._regime_traders[product].step()
+                action = result.get("action", "HOLD")
+                if action not in {"HOLD", "NO_DATA"}:
+                    log.info("Regime %s: %s", product, action)
 
         except Exception:
             log.exception("Arb error for product %s", product)

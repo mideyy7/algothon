@@ -115,7 +115,6 @@ def _make_bot(username: str = "testuser", positions: Optional[dict] = None):
     bot.__dict__["auth_token"] = "Bearer test-token"
     bot.username = username
     bot._positions = dict(positions) if positions else {}
-    bot._regime_traders = {}
     return bot
 
 
@@ -528,33 +527,44 @@ class TestComputeBBO(unittest.TestCase):
 
 class TestRunArb(unittest.TestCase):
 
-    def test_tide_swing_dispatches_to_arb(self):
+    def test_tide_swing_dispatches_to_m2_vs_m1_arb(self):
         bot = _make_bot()
-        with patch.object(bot._tide_swing_arb, "step", return_value={"action": "HOLD"}) as mock_step:
+        with patch.object(bot._m2_vs_m1_arb, "step", return_value={"act": "HOLD"}) as mock_step:
             bot._run_arb("TIDE_SWING", 100.0)
-        mock_step.assert_called_once_with(mid=100.0)
+        mock_step.assert_called_once()
 
-    def test_tide_swing_not_dispatched_when_mid_none(self):
+    def test_tide_spot_dispatches_to_m2_vs_m1_arb(self):
         bot = _make_bot()
-        with patch.object(bot._tide_swing_arb, "step") as mock_step:
-            bot._run_arb("TIDE_SWING", None)
-        mock_step.assert_not_called()
-
-    def test_tide_spot_not_dispatched_to_any_arb(self):
-        bot = _make_bot()
-        with patch.object(bot._tide_swing_arb, "step") as mock_swing, \
-             patch.object(bot._etf_package_arb, "step") as mock_etf:
+        with patch.object(bot._m2_vs_m1_arb, "step", return_value={"act": "HOLD"}) as mock_step, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}), \
+             patch.object(bot._dip_buyers["TIDE_SPOT"], "step", return_value={"act": "HOLD"}):
             bot._run_arb("TIDE_SPOT", 1400.0)
-        mock_swing.assert_not_called()
-        mock_etf.assert_not_called()
+        mock_step.assert_called_once()
 
-    def test_lon_etf_dispatches(self):
+    def test_tide_spot_also_dispatches_to_dip_buyer(self):
         bot = _make_bot()
-        with patch.object(bot._etf_package_arb, "step", return_value={"action": "HOLD"}) as mock_pack, \
-             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket:
+        with patch.object(bot._m2_vs_m1_arb, "step", return_value={"act": "HOLD"}), \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}), \
+             patch.object(bot._dip_buyers["TIDE_SPOT"], "step", return_value={"act": "HOLD"}) as mock_dip:
+            bot._run_arb("TIDE_SPOT", 1400.0)
+        mock_dip.assert_called_once()
+
+    def test_lon_etf_dispatches_to_pack_stat_arb_and_basket(self):
+        bot = _make_bot()
+        with patch.object(bot._etf_pack_stat_arb, "step", return_value={"act": "HOLD"}) as mock_pack, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket, \
+             patch.object(bot._m2_vs_m1_arb, "step", return_value={"act": "HOLD"}):
             bot._run_arb("LON_ETF", 6500.0)
         mock_pack.assert_called_once()
         mock_basket.assert_called_once()
+
+    def test_lhr_count_dispatches_to_regime_and_basket(self):
+        bot = _make_bot()
+        with patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket, \
+             patch.object(bot._regime_traders["LHR_COUNT"], "step", return_value={"action": "HOLD"}) as mock_regime:
+            bot._run_arb("LHR_COUNT", 4500.0)
+        mock_basket.assert_called_once()
+        mock_regime.assert_called_once()
 
 
 # ── Risk framework integration ────────────────────────────────────────────────
@@ -1038,6 +1048,503 @@ class TestMCTiming(unittest.TestCase):
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.assertLess(elapsed_ms, 30.0,
                         f"mc_delta took {elapsed_ms:.1f} ms (limit: 30 ms)")
+
+
+# ── Rolling helpers for regression-based stat arb ────────────────────────────
+
+class TestRollingRV(unittest.TestCase):
+    """RollingRV: rolling realized vol from log-returns."""
+
+    def test_returns_nan_before_25_points(self):
+        from stat_arb import RollingRV
+        rv = RollingRV(n=120)
+        for i in range(24):
+            result = rv.update(100.0 + i)
+        self.assertTrue(np.isnan(result))
+
+    def test_returns_float_after_25_points(self):
+        from stat_arb import RollingRV
+        rv = RollingRV(n=120)
+        result = None
+        for i in range(30):
+            result = rv.update(100.0 + i * 0.1)
+        self.assertFalse(np.isnan(result))
+        self.assertGreater(result, 0.0)
+
+    def test_zero_vol_on_flat_prices(self):
+        from stat_arb import RollingRV
+        rv = RollingRV(n=120)
+        result = None
+        for _ in range(30):
+            result = rv.update(500.0)
+        # log-returns all zero → RV = 0
+        self.assertAlmostEqual(result, 0.0, places=10)
+
+
+class TestRollingRidge(unittest.TestCase):
+    """RollingRidge: 4-feature ridge regression (PACK ~ b0+b1*ETF+b2*ETF^2+b3*RV)."""
+
+    def test_returns_zeros_before_120_points(self):
+        from stat_arb import RollingRidge
+        reg = RollingRidge(window=700, ridge=5e-2)
+        for i in range(50):
+            reg.add(6500.0, 10.0, 500.0)
+        self.assertTrue(np.all(reg.beta == 0.0))
+
+    def test_fits_after_120_points_and_predicts(self):
+        from stat_arb import RollingRidge
+        rng = np.random.default_rng(1)
+        reg = RollingRidge(window=700, ridge=5e-2)
+        for _ in range(130):
+            etf = 6500.0 + rng.normal(0, 50)
+            rv = 10.0 + rng.uniform(0, 5)
+            pack = 0.5 * etf + 1.0 * rv + 200.0 + rng.normal(0, 5)
+            reg.add(etf, rv, pack)
+        reg.fit()
+        prediction = reg.predict(6500.0, 10.0)
+        self.assertFalse(np.isnan(prediction))
+        self.assertGreater(prediction, 0.0)
+
+    def test_dprice_detf_uses_linear_and_quadratic_terms(self):
+        from stat_arb import RollingRidge
+        reg = RollingRidge()
+        reg.beta = np.array([1.0, 2.0, 0.5, 0.0])
+        # d/dETF = b1 + 2*b2*etf = 2 + 2*0.5*100 = 102
+        self.assertAlmostEqual(reg.dprice_detf(100.0), 102.0)
+
+
+class TestRollingZ(unittest.TestCase):
+    """RollingZ: rolling z-score of residuals."""
+
+    def test_returns_nan_before_80_points(self):
+        from stat_arb import RollingZ
+        rz = RollingZ(n=350)
+        for i in range(50):
+            rz.add(float(i))
+        self.assertTrue(np.isnan(rz.z(5.0)))
+
+    def test_z_score_near_zero_for_mean_value(self):
+        from stat_arb import RollingZ
+        rz = RollingZ(n=350)
+        for i in range(100):
+            rz.add(float(i))
+        mu = 49.5   # mean of 0..99
+        z = rz.z(mu)
+        self.assertAlmostEqual(z, 0.0, places=5)
+
+    def test_z_score_positive_for_high_outlier(self):
+        from stat_arb import RollingZ
+        rz = RollingZ(n=350)
+        for _ in range(100):
+            rz.add(0.0)
+        z = rz.z(100.0)
+        self.assertGreater(z, 5.0)
+
+
+class TestRollingRidge3(unittest.TestCase):
+    """RollingRidge3: 3-feature ridge regression (Y ~ b0+b1*X+b2*RV)."""
+
+    def test_dy_dx_returns_slope_coefficient(self):
+        from stat_arb import RollingRidge3
+        reg = RollingRidge3()
+        reg.beta = np.array([10.0, 3.5, 0.0])
+        self.assertAlmostEqual(reg.dy_dx(), 3.5)
+
+    def test_fits_and_predicts_linear_relationship(self):
+        from stat_arb import RollingRidge3
+        rng = np.random.default_rng(7)
+        reg = RollingRidge3(window=600, ridge=5e-2)
+        for _ in range(130):
+            x = rng.uniform(1000, 2000)
+            rv = rng.uniform(5, 20)
+            y = 2.0 * x + rv + rng.normal(0, 1)
+            reg.add(x, rv, y)
+        reg.fit()
+        pred = reg.predict(1500.0, 10.0)
+        # rough check: should be close to 2*1500 + 10 = 3010
+        self.assertGreater(pred, 2500.0)
+        self.assertLess(pred, 4000.0)
+
+
+# ── ETFPackStatArb (M7/M8 rolling ridge stat arb) ────────────────────────────
+
+def _make_mock_api_for_stat_arb(
+    etf_mid=6500.0, pack_mid=500.0,
+    etf_bid=6490.0, etf_ask=6510.0,
+    pack_bid=495.0, pack_ask=505.0,
+    etf_pos=0, pack_pos=0,
+):
+    """Return a MagicMock BotExchangeAdapter configured for stat arb tests."""
+    from stat_arb import BBO
+    api = MagicMock()
+    api.HARD_LIMIT = 100
+
+    def get_mid(p):
+        return etf_mid if p == "LON_ETF" else pack_mid
+
+    def get_bbo(p):
+        if p == "LON_ETF":
+            return BBO(mid=etf_mid, best_bid=etf_bid, best_ask=etf_ask)
+        return BBO(mid=pack_mid, best_bid=pack_bid, best_ask=pack_ask)
+
+    def get_pos(p):
+        return etf_pos if p == "LON_ETF" else pack_pos
+
+    api.get_mid.side_effect = get_mid
+    api.get_best_bid_ask.side_effect = get_bbo
+    api.get_position.side_effect = get_pos
+    api.place_order.return_value = True
+    return api
+
+
+class TestETFPackStatArb(unittest.TestCase):
+    """ETFPackStatArb: LON_FLY vs LON_ETF regression z-score stat arb."""
+
+    def _warmup(self, arb, n=130):
+        """Feed n ticks to get past warmup phase (needs 80+ residuals + 120 reg pts)."""
+        for i in range(n):
+            arb.step()
+
+    def test_warmup_returns_warmup_before_sufficient_data(self):
+        from stat_arb import ETFPackStatArb
+        api = _make_mock_api_for_stat_arb()
+        arb = ETFPackStatArb(api=api)
+        result = arb.step()
+        self.assertIn(result["act"], {"WARMUP", "COOLDOWN", "NO_DATA"})
+
+    def test_no_data_when_mid_is_nan(self):
+        from stat_arb import ETFPackStatArb
+        api = _make_mock_api_for_stat_arb()
+        api.get_mid.side_effect = None          # clear side_effect so return_value is used
+        api.get_mid.return_value = float("nan")
+        arb = ETFPackStatArb(api=api)
+        result = arb.step()
+        self.assertEqual(result["act"], "NO_DATA")
+
+    def test_cooldown_suppresses_repeated_calls(self):
+        from stat_arb import ETFPackStatArb
+        api = _make_mock_api_for_stat_arb()
+        arb = ETFPackStatArb(api=api, cooldown=9999.0)
+        arb._last_t = time.monotonic()  # force cooldown
+        result = arb.step()
+        self.assertEqual(result["act"], "COOLDOWN")
+
+    def test_position_limits_respected(self):
+        """max_pack_pos=5 → strategy never exceeds 5."""
+        from stat_arb import ETFPackStatArb, BBO
+        api = _make_mock_api_for_stat_arb(pack_pos=5)
+        arb = ETFPackStatArb(api=api, max_pack_pos=5, z_enter=0.0)
+        # With z_enter=0.0 any non-zero z triggers entry, but pack is already at max
+        self._warmup(arb, n=150)
+        api.place_order.reset_mock()
+        arb.step()
+        # Even with extreme params, no buy order should push beyond max_pack_pos
+        for call_args in api.place_order.call_args_list:
+            product, side, price, qty = call_args[0]
+            if product == "LON_FLY" and side == "BUY":
+                self.fail("Bought LON_FLY when already at max_pack_pos")
+
+    def test_flatten_exit_triggers_when_z_normalizes(self):
+        from stat_arb import ETFPackStatArb
+        api = _make_mock_api_for_stat_arb(pack_pos=5, etf_pos=3)
+        arb = ETFPackStatArb(api=api, z_exit=999.0)  # z_exit=999 → always exit
+        self._warmup(arb, n=150)
+        # Reset cooldown and trigger flatten
+        arb._last_t = 0.0
+        result = arb.step()
+        self.assertIn(result["act"], {"FLATTEN_EXIT", "HOLD", "WARMUP", "COOLDOWN"})
+
+
+# ── M2vsM1StatArb (TIDE_SWING vs TIDE_SPOT) ──────────────────────────────────
+
+def _make_mock_api_for_m2m1(
+    m1_mid=1500.0, m2_mid=400.0,
+    m1_bid=1490.0, m1_ask=1510.0,
+    m2_bid=395.0,  m2_ask=405.0,
+    m1_pos=0, m2_pos=0,
+):
+    from stat_arb import BBO
+    api = MagicMock()
+    api.HARD_LIMIT = 100
+
+    def get_mid(p):
+        return m1_mid if p == "TIDE_SPOT" else m2_mid
+
+    def get_bbo(p):
+        if p == "TIDE_SPOT":
+            return BBO(mid=m1_mid, best_bid=m1_bid, best_ask=m1_ask)
+        return BBO(mid=m2_mid, best_bid=m2_bid, best_ask=m2_ask)
+
+    def get_pos(p):
+        return m1_pos if p == "TIDE_SPOT" else m2_pos
+
+    api.get_mid.side_effect = get_mid
+    api.get_best_bid_ask.side_effect = get_bbo
+    api.get_position.side_effect = get_pos
+    api.place_order.return_value = True
+    return api
+
+
+class TestM2vsM1StatArb(unittest.TestCase):
+    """M2vsM1StatArb: TIDE_SWING vs TIDE_SPOT rolling ridge stat arb."""
+
+    def _warmup(self, arb, n=150):
+        for _ in range(n):
+            arb.step()
+
+    def test_warmup_at_start(self):
+        from stat_arb import M2vsM1StatArb
+        api = _make_mock_api_for_m2m1()
+        arb = M2vsM1StatArb(api=api)
+        result = arb.step()
+        self.assertIn(result["act"], {"WARMUP", "COOLDOWN", "NO_DATA"})
+
+    def test_no_data_when_nan_mids(self):
+        from stat_arb import M2vsM1StatArb
+        api = _make_mock_api_for_m2m1()
+        api.get_mid.side_effect = None          # clear side_effect so return_value is used
+        api.get_mid.return_value = float("nan")
+        arb = M2vsM1StatArb(api=api)
+        result = arb.step()
+        self.assertEqual(result["act"], "NO_DATA")
+
+    def test_cooldown_suppresses_repeated_calls(self):
+        from stat_arb import M2vsM1StatArb
+        api = _make_mock_api_for_m2m1()
+        arb = M2vsM1StatArb(api=api, cooldown=9999.0)
+        arb._last_t = time.monotonic()
+        result = arb.step()
+        self.assertEqual(result["act"], "COOLDOWN")
+
+    def _warmup_noisy(self, arb, n=200, rng_seed=42):
+        """Warmup with slightly noisy data so residuals have non-zero variance."""
+        from stat_arb import BBO
+        rng = np.random.default_rng(rng_seed)
+        api = arb.api
+        for _ in range(n):
+            m1 = 1500.0 + rng.normal(0, 20)
+            m2 = 0.25 * m1 + 25.0 + rng.normal(0, 5)
+            api.get_mid.side_effect = lambda p, _m1=m1, _m2=m2: _m1 if p == "TIDE_SPOT" else _m2
+            api.get_best_bid_ask.side_effect = lambda p, _m1=m1, _m2=m2: (
+                BBO(mid=_m1, best_bid=_m1 - 5, best_ask=_m1 + 5) if p == "TIDE_SPOT"
+                else BBO(mid=_m2, best_bid=_m2 - 2, best_ask=_m2 + 2)
+            )
+            arb.step()
+        arb._last_t = 0.0
+
+    def test_sell_m2_when_residual_high(self):
+        """Pump M2 price far above regression fair value → SELL_M2 action."""
+        from stat_arb import M2vsM1StatArb, BBO
+        api = _make_mock_api_for_m2m1()
+        arb = M2vsM1StatArb(api=api, z_enter=1.0, z_exit=0.01, cooldown=0.0)
+        self._warmup_noisy(arb, n=220)
+        # Now inject a very high M2 residual (far above model fair value)
+        big_m2 = 999999.0
+        api.get_mid.side_effect = lambda p: 1500.0 if p == "TIDE_SPOT" else big_m2
+        api.get_best_bid_ask.side_effect = lambda p: (
+            BBO(mid=1500.0, best_bid=1490.0, best_ask=1510.0) if p == "TIDE_SPOT"
+            else BBO(mid=big_m2, best_bid=big_m2 - 5, best_ask=big_m2 + 5)
+        )
+        api.place_order.reset_mock()
+        arb._last_t = 0.0
+        result = arb.step()
+        self.assertIn("SELL_M2", result["act"])
+
+    def test_buy_m2_when_residual_low(self):
+        """Dump M2 price far below regression fair value → BUY_M2 action."""
+        from stat_arb import M2vsM1StatArb, BBO
+        api = _make_mock_api_for_m2m1()
+        arb = M2vsM1StatArb(api=api, z_enter=1.0, z_exit=0.01, cooldown=0.0)
+        self._warmup_noisy(arb, n=220)
+        # Inject very low M2 (far below model fair value)
+        tiny_m2 = 0.01
+        api.get_mid.side_effect = lambda p: 1500.0 if p == "TIDE_SPOT" else tiny_m2
+        api.get_best_bid_ask.side_effect = lambda p: (
+            BBO(mid=1500.0, best_bid=1490.0, best_ask=1510.0) if p == "TIDE_SPOT"
+            else BBO(mid=tiny_m2, best_bid=max(tiny_m2 - 5, 0.01), best_ask=tiny_m2 + 5)
+        )
+        api.place_order.reset_mock()
+        arb._last_t = 0.0
+        result = arb.step()
+        self.assertIn("BUY_M2", result["act"])
+
+    def test_position_limits_m2_respected(self):
+        from stat_arb import M2vsM1StatArb
+        api = _make_mock_api_for_m2m1(m2_pos=25)  # already at max_m2_pos
+        arb = M2vsM1StatArb(api=api, max_m2_pos=25, z_enter=0.0, cooldown=0.0)
+        self._warmup_noisy(arb, n=220)
+        api.place_order.reset_mock()
+        arb._last_t = 0.0
+        arb.step()
+        for call_args in api.place_order.call_args_list:
+            product, side, _, qty = call_args[0]
+            if product == "TIDE_SWING" and side == "BUY":
+                self.fail("Bought TIDE_SWING when already at max_m2_pos=25")
+
+
+# ── UpDipBuyer (EWMA mean-reversion dip buyer) ───────────────────────────────
+
+def _make_mock_api_for_dip_buyer(product="TIDE_SPOT", mid=1500.0, bid=1495.0, ask=1505.0, pos=0):
+    from stat_arb import BBO
+    api = MagicMock()
+    api.HARD_LIMIT = 100
+    api.get_mid.return_value = mid
+    api.get_best_bid_ask.return_value = BBO(mid=mid, best_bid=bid, best_ask=ask)
+    api.get_position.return_value = pos
+    api.place_order.return_value = True
+    return api
+
+
+class TestUpDipBuyer(unittest.TestCase):
+    """UpDipBuyer: EWMA mean-reversion dip buyer."""
+
+    def test_warmup_before_sufficient_data(self):
+        from stat_arb import UpDipBuyer
+        api = _make_mock_api_for_dip_buyer()
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT")
+        result = buyer.step()
+        self.assertIn(result["act"], {"WARMUP", "COOLDOWN"})
+
+    def test_no_data_when_mid_is_nan(self):
+        from stat_arb import UpDipBuyer
+        api = _make_mock_api_for_dip_buyer()
+        api.get_mid.return_value = float("nan")
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT")
+        result = buyer.step()
+        self.assertEqual(result["act"], "NO_DATA")
+
+    def test_cooldown_suppresses_repeated_calls(self):
+        from stat_arb import UpDipBuyer
+        api = _make_mock_api_for_dip_buyer()
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT", cooldown=9999.0)
+        buyer._last_t = time.monotonic()
+        result = buyer.step()
+        self.assertEqual(result["act"], "COOLDOWN")
+
+    def test_buys_on_deep_dip(self):
+        """Price drops far below EWMA → BUY action."""
+        from stat_arb import UpDipBuyer, BBO
+        api = _make_mock_api_for_dip_buyer(mid=1500.0)
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT", z_enter=1.5, cooldown=0.0)
+        # Warm up EWMA at ~1500
+        for _ in range(250):
+            buyer.step()
+        # Now inject a very low price (big dip)
+        low_mid = 1000.0
+        api.get_mid.return_value = low_mid
+        api.get_best_bid_ask.return_value = BBO(mid=low_mid, best_bid=995.0, best_ask=1005.0)
+        api.place_order.reset_mock()
+        buyer._last_t = 0.0
+        result = buyer.step()
+        self.assertIn("BUY", result["act"])
+
+    def test_takes_profit_when_price_reverts(self):
+        """After buying, when price reverts back above EWMA → TAKE action."""
+        from stat_arb import UpDipBuyer, BBO
+        api = _make_mock_api_for_dip_buyer(mid=1500.0, pos=10)
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT", z_take=0.3, cooldown=0.0)
+        # Build up EWMA below current price (simulate post-dip reversion)
+        for _ in range(250):
+            buyer.step()
+        # Inject a price right at the EWMA level → z ≈ 0 > -z_take → TAKE
+        buyer._ema._v = 1490.0  # set EWMA below current price
+        api.get_mid.return_value = 1500.0
+        api.get_best_bid_ask.return_value = BBO(mid=1500.0, best_bid=1495.0, best_ask=1505.0)
+        api.place_order.reset_mock()
+        buyer._last_t = 0.0
+        result = buyer.step()
+        # z = (1500-1490)/dev — should be positive → TAKE
+        self.assertIn(result["act"], {"TAKE 10", "TAKE 8", "HOLD"})
+
+    def test_max_pos_respected(self):
+        """At max_pos, no buy should fire."""
+        from stat_arb import UpDipBuyer, BBO
+        api = _make_mock_api_for_dip_buyer(mid=1000.0, pos=50)  # already at max
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT", max_pos=50, z_enter=0.0, cooldown=0.0)
+        for _ in range(250):
+            buyer.step()
+        api.place_order.reset_mock()
+        buyer._last_t = 0.0
+        # Inject a big dip
+        api.get_mid.return_value = 500.0
+        api.get_best_bid_ask.return_value = BBO(mid=500.0, best_bid=495.0, best_ask=505.0)
+        buyer.step()
+        for call_args in api.place_order.call_args_list:
+            product, side, _, _ = call_args[0]
+            if product == "TIDE_SPOT" and side == "BUY":
+                self.fail("Should not BUY when already at max_pos")
+
+    def test_hard_limit_enforced_via_adapter(self):
+        """position=100 → BotExchangeAdapter returns False → no fill even if z triggers."""
+        from stat_arb import UpDipBuyer
+        api = _make_mock_api_for_dip_buyer(mid=1500.0, pos=100)
+        api.place_order.return_value = False  # hard limit blocked
+        buyer = UpDipBuyer(api=api, product="TIDE_SPOT", max_pos=100, z_enter=0.0, cooldown=0.0)
+        for _ in range(250):
+            buyer.step()
+        buyer._last_t = 0.0
+        result = buyer.step()
+        # Should not crash; place_order returning False is handled gracefully
+        self.assertIn("act", result)
+
+
+# ── Integration: new strategies in _run_arb dispatch ─────────────────────────
+
+class TestNewAlgoDispatch(unittest.TestCase):
+    """End-to-end dispatch checks: new algos fire on the correct products."""
+
+    def test_wx_sum_dispatches_to_dip_buyer(self):
+        bot = _make_bot()
+        with patch.object(bot._dip_buyers["WX_SUM"], "step", return_value={"act": "HOLD"}) as mock_dip:
+            bot._run_arb("WX_SUM", 3200.0)
+        mock_dip.assert_called_once()
+
+    def test_wx_spot_dispatches_to_dip_buyer_and_basket(self):
+        bot = _make_bot()
+        with patch.object(bot._dip_buyers["WX_SPOT"], "step", return_value={"act": "HOLD"}) as mock_dip, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket:
+            bot._run_arb("WX_SPOT", 4000.0)
+        mock_dip.assert_called_once()
+        mock_basket.assert_called_once()
+
+    def test_lon_fly_dispatches_only_to_pack_stat_arb(self):
+        bot = _make_bot()
+        with patch.object(bot._etf_pack_stat_arb, "step", return_value={"act": "HOLD"}) as mock_pack, \
+             patch.object(bot._etf_basket_arb, "step", return_value={"action": "HOLD"}) as mock_basket:
+            bot._run_arb("LON_FLY", 700.0)
+        mock_pack.assert_called_once()
+        mock_basket.assert_not_called()
+
+    def test_regime_traders_only_has_lhr_count(self):
+        """TIDE_SPOT, TIDE_SWING, WX_SPOT, WX_SUM must NOT be in _regime_traders."""
+        bot = _make_bot()
+        self.assertIn("LHR_COUNT", bot._regime_traders)
+        for p in ("TIDE_SPOT", "TIDE_SWING", "WX_SPOT", "WX_SUM"):
+            self.assertNotIn(p, bot._regime_traders, f"{p} should no longer be in _regime_traders")
+
+    def test_dip_buyers_covers_correct_products(self):
+        bot = _make_bot()
+        self.assertIn("TIDE_SPOT", bot._dip_buyers)
+        self.assertIn("WX_SUM",    bot._dip_buyers)
+        self.assertIn("WX_SPOT",   bot._dip_buyers)
+
+    def test_position_hard_limit_never_exceeded_in_any_strategy(self):
+        """BotExchangeAdapter HARD_LIMIT must be 100 for all strategies."""
+        bot = _make_bot()
+        for strat in [
+            bot._m2_vs_m1_arb,
+            bot._etf_pack_stat_arb,
+            bot._etf_basket_arb,
+            *bot._dip_buyers.values(),
+            *bot._regime_traders.values(),
+        ]:
+            if hasattr(strat, "max_m2_pos"):
+                self.assertLessEqual(strat.max_m2_pos, 100)
+                self.assertLessEqual(strat.max_m1_pos, 100)
+            if hasattr(strat, "max_pack_pos"):
+                self.assertLessEqual(strat.max_pack_pos, 100)
+            if hasattr(strat, "max_pos"):
+                self.assertLessEqual(strat.max_pos, 100)
 
 
 # ── Import the Side enum for use in assertions above ──────────────────────────

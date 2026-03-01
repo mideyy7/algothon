@@ -18,6 +18,7 @@ enforces the ±100 hard position limit as a final safety net on every order.
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, Any, List
 
@@ -698,6 +699,472 @@ class ETFPackageImpliedVolArb:
             "pack_pos": pack_pos,
             "action": act,
         }
+
+
+# ---------------------------------------------------------------------------
+# Rolling helpers for regression-based stat arb (from new algo files)
+# ---------------------------------------------------------------------------
+
+class RollingRV:
+    """Rolling realized volatility (log-return RMS) over the last n prices."""
+
+    def __init__(self, n: int = 120):
+        self._px: deque = deque(maxlen=n + 1)
+
+    def update(self, p: float) -> float:
+        self._px.append(float(p))
+        if len(self._px) < 25:
+            return float("nan")
+        r = np.diff(np.log(np.array(self._px)))
+        return float(np.sqrt(np.mean(r * r)))
+
+
+class RollingRidge:
+    """Rolling ridge regression: PACK ~ b0 + b1*ETF + b2*ETF² + b3*RV."""
+
+    def __init__(self, window: int = 700, ridge: float = 5e-2):
+        self._X: deque = deque(maxlen=window)
+        self._y: deque = deque(maxlen=window)
+        self._ridge = float(ridge)
+        self.beta = np.zeros(4)
+
+    def add(self, etf: float, rv: float, pack: float) -> None:
+        if np.isnan(rv):
+            return
+        self._X.append(np.array([1.0, etf, etf * etf, rv], dtype=float))
+        self._y.append(float(pack))
+
+    def fit(self) -> np.ndarray:
+        if len(self._y) < 120:
+            return self.beta
+        X = np.vstack(self._X)
+        y = np.array(self._y)
+        lam = self._ridge * np.eye(4)
+        self.beta = np.linalg.solve(X.T @ X + lam, X.T @ y)
+        return self.beta
+
+    def predict(self, etf: float, rv: float) -> float:
+        x = np.array([1.0, etf, etf * etf, rv], dtype=float)
+        return float(x @ self.beta)
+
+    def dprice_detf(self, etf: float) -> float:
+        return float(self.beta[1] + 2.0 * self.beta[2] * etf)
+
+
+class RollingZ:
+    """Rolling z-score of a residual series."""
+
+    def __init__(self, n: int = 350):
+        self._r: deque = deque(maxlen=n)
+
+    def add(self, v: float) -> None:
+        self._r.append(float(v))
+
+    def z(self, v: float) -> float:
+        if len(self._r) < 80:
+            return float("nan")
+        arr = np.array(self._r, dtype=float)
+        mu = float(arr.mean())
+        sd = float(arr.std()) + 1e-9
+        return (v - mu) / sd
+
+
+class RollingRidge3:
+    """Rolling ridge regression (3-feature): Y ~ b0 + b1*X + b2*RV."""
+
+    def __init__(self, window: int = 600, ridge: float = 5e-2):
+        self._X: deque = deque(maxlen=window)
+        self._y: deque = deque(maxlen=window)
+        self._ridge = float(ridge)
+        self.beta = np.zeros(3)
+
+    def add(self, x: float, rv: float, y: float) -> None:
+        if np.isnan(rv):
+            return
+        self._X.append(np.array([1.0, x, rv], dtype=float))
+        self._y.append(float(y))
+
+    def fit(self) -> np.ndarray:
+        if len(self._y) < 120:
+            return self.beta
+        X = np.vstack(self._X)
+        y = np.array(self._y)
+        lam = self._ridge * np.eye(3)
+        self.beta = np.linalg.solve(X.T @ X + lam, X.T @ y)
+        return self.beta
+
+    def predict(self, x: float, rv: float) -> float:
+        v = np.array([1.0, x, rv], dtype=float)
+        return float(v @ self.beta)
+
+    def dy_dx(self) -> float:
+        return float(self.beta[1])
+
+
+# ---------------------------------------------------------------------------
+# Strategy D: ETFPackStatArb — LON_ETF vs LON_FLY rolling ridge stat arb
+# ---------------------------------------------------------------------------
+
+class ETFPackStatArb:
+    """Statistical arbitrage between LON_FLY (Market 8) and LON_ETF (Market 7).
+
+    Uses rolling ridge regression (PACK ~ b0 + b1*ETF + b2*ETF² + b3*RV) to
+    estimate fair value of the option package, then trades z-score deviations
+    of the residual (market price − model price).
+
+    Delta-hedges in ETF using the regression's dPACK/dETF evaluated at the
+    current ETF level.
+
+    Position limits:
+        max_pack_pos, max_etf_pos — strategy-level soft caps.
+        BotExchangeAdapter enforces ±100 as the final hard backstop.
+    """
+
+    def __init__(
+        self,
+        api: BotExchangeAdapter,
+        etf: str = "LON_ETF",
+        pack: str = "LON_FLY",
+        max_pack_pos: int = 18,
+        max_etf_pos: int = 35,
+        clip_pack: int = 3,
+        clip_etf: int = 6,
+        z_enter: float = 2.5,
+        z_exit: float = 0.6,
+        cooldown: float = 0.15,
+    ):
+        self.api = api
+        self.etf = etf
+        self.pack = pack
+        self.max_pack_pos = min(int(max_pack_pos), api.HARD_LIMIT)
+        self.max_etf_pos = min(int(max_etf_pos), api.HARD_LIMIT)
+        self.clip_pack = int(clip_pack)
+        self.clip_etf = int(clip_etf)
+        self.z_enter = float(z_enter)
+        self.z_exit = float(z_exit)
+        self.cooldown = float(cooldown)
+        self._last_t = 0.0
+
+        self._rv = RollingRV(n=120)
+        self._reg = RollingRidge(window=700, ridge=5e-2)
+        self._resid = RollingZ(n=350)
+
+    def _flatten_pair(self, clip: int = 8) -> None:
+        for p in [self.pack, self.etf]:
+            pos = self.api.get_position(p)
+            if pos == 0:
+                continue
+            bbo = self.api.get_best_bid_ask(p)
+            q = int(min(abs(pos), clip))
+            if pos > 0 and bbo.best_bid is not None:
+                self.api.place_order(p, "SELL", bbo.best_bid, q)
+            elif pos < 0 and bbo.best_ask is not None:
+                self.api.place_order(p, "BUY", bbo.best_ask, q)
+
+    def step(self) -> dict:
+        now = time.monotonic()
+        if now - self._last_t < self.cooldown:
+            return {"act": "COOLDOWN"}
+
+        etf_mid = self.api.get_mid(self.etf)
+        pack_mid = self.api.get_mid(self.pack)
+        if np.isnan(etf_mid) or np.isnan(pack_mid):
+            return {"act": "NO_DATA"}
+
+        bbo_p = self.api.get_best_bid_ask(self.pack)
+        bbo_e = self.api.get_best_bid_ask(self.etf)
+        bid_p, ask_p = bbo_p.best_bid, bbo_p.best_ask
+        bid_e, ask_e = bbo_e.best_bid, bbo_e.best_ask
+
+        rv = self._rv.update(etf_mid)
+        if np.isnan(rv):
+            return {"act": "WARMUP", "z": float("nan"), "resid": float("nan"), "fair": float("nan")}
+
+        self._reg.add(etf_mid, rv, pack_mid)
+        self._reg.fit()
+
+        fair = self._reg.predict(etf_mid, rv)
+        r = pack_mid - fair
+        if not np.isnan(r):
+            self._resid.add(r)
+        z = self._resid.z(r)
+
+        pack_pos = self.api.get_position(self.pack)
+        etf_pos = self.api.get_position(self.etf)
+
+        # Exit: flatten when spread has normalized
+        if (not np.isnan(z)) and abs(z) < self.z_exit:
+            if pack_pos != 0 or etf_pos != 0:
+                self._flatten_pair(clip=8)
+                self._last_t = now
+                return {"act": "FLATTEN_EXIT", "z": z, "resid": r, "fair": fair}
+
+        if np.isnan(z):
+            return {"act": "WARMUP", "z": z, "resid": r, "fair": fair}
+
+        dP_dE = self._reg.dprice_detf(etf_mid)
+
+        # Residual high => pack rich => SELL pack + hedge ETF long
+        if z > self.z_enter:
+            room_sell_pack = max(0, self.max_pack_pos + pack_pos)
+            if room_sell_pack > 0 and bid_p is not None:
+                q_pack = int(min(self.clip_pack, room_sell_pack))
+                self.api.place_order(self.pack, "SELL", bid_p, q_pack)
+
+                hedge = int(np.clip(dP_dE * q_pack, -self.clip_etf, self.clip_etf))
+                room_buy_etf  = max(0, self.max_etf_pos - etf_pos)
+                room_sell_etf = max(0, self.max_etf_pos + etf_pos)
+                if hedge > 0 and room_buy_etf > 0 and ask_e is not None:
+                    self.api.place_order(self.etf, "BUY",  ask_e, int(min(hedge,  room_buy_etf)))
+                elif hedge < 0 and room_sell_etf > 0 and bid_e is not None:
+                    self.api.place_order(self.etf, "SELL", bid_e, int(min(-hedge, room_sell_etf)))
+
+                self._last_t = now
+                return {"act": f"SELL_PACK {q_pack} HEDGE {hedge}", "z": z, "resid": r, "fair": fair}
+
+        # Residual low => pack cheap => BUY pack + hedge ETF short
+        if z < -self.z_enter:
+            room_buy_pack = max(0, self.max_pack_pos - pack_pos)
+            if room_buy_pack > 0 and ask_p is not None:
+                q_pack = int(min(self.clip_pack, room_buy_pack))
+                self.api.place_order(self.pack, "BUY", ask_p, q_pack)
+
+                hedge = int(np.clip(dP_dE * q_pack, -self.clip_etf, self.clip_etf))
+                room_buy_etf  = max(0, self.max_etf_pos - etf_pos)
+                room_sell_etf = max(0, self.max_etf_pos + etf_pos)
+                if hedge > 0 and room_sell_etf > 0 and bid_e is not None:
+                    self.api.place_order(self.etf, "SELL", bid_e, int(min(hedge,  room_sell_etf)))
+                elif hedge < 0 and room_buy_etf > 0 and ask_e is not None:
+                    self.api.place_order(self.etf, "BUY",  ask_e, int(min(-hedge, room_buy_etf)))
+
+                self._last_t = now
+                return {"act": f"BUY_PACK {q_pack} HEDGE {hedge}", "z": z, "resid": r, "fair": fair}
+
+        return {"act": "HOLD", "z": z, "resid": r, "fair": fair}
+
+
+# ---------------------------------------------------------------------------
+# Strategy E: M2vsM1StatArb — TIDE_SWING (M2) vs TIDE_SPOT (M1) stat arb
+# ---------------------------------------------------------------------------
+
+class M2vsM1StatArb:
+    """Statistical arbitrage: TIDE_SWING (Market 2) vs TIDE_SPOT (Market 1).
+
+    Uses rolling ridge regression (M2 ~ b0 + b1*M1 + b2*RV) to estimate the
+    fair value of TIDE_SWING relative to current tidal height, then trades
+    z-score deviations of the residual.
+
+    TIDE_SPOT is used both as the regression signal and as a delta hedge.
+
+    Position limits:
+        max_m2_pos, max_m1_pos — strategy-level soft caps.
+        BotExchangeAdapter enforces ±100 as the final hard backstop.
+    """
+
+    def __init__(
+        self,
+        api: BotExchangeAdapter,
+        m1: str = "TIDE_SPOT",
+        m2: str = "TIDE_SWING",
+        max_m2_pos: int = 25,
+        max_m1_pos: int = 60,
+        clip_m2: int = 4,
+        clip_m1: int = 8,
+        z_enter: float = 2.3,
+        z_exit: float = 0.6,
+        cooldown: float = 0.2,
+    ):
+        self.api = api
+        self.m1 = m1
+        self.m2 = m2
+        self.max_m2_pos = min(int(max_m2_pos), api.HARD_LIMIT)
+        self.max_m1_pos = min(int(max_m1_pos), api.HARD_LIMIT)
+        self.clip_m2 = int(clip_m2)
+        self.clip_m1 = int(clip_m1)
+        self.z_enter = float(z_enter)
+        self.z_exit = float(z_exit)
+        self.cooldown = float(cooldown)
+        self._last_t = 0.0
+
+        self._rv = RollingRV(n=120)
+        self._reg = RollingRidge3(window=650, ridge=5e-2)
+        self._res = Rolling(n=350)
+
+    def _flatten(self, clip: int = 10) -> None:
+        for p in [self.m2, self.m1]:
+            pos = self.api.get_position(p)
+            if pos == 0:
+                continue
+            bbo = self.api.get_best_bid_ask(p)
+            q = int(min(abs(pos), clip))
+            if pos > 0 and bbo.best_bid is not None:
+                self.api.place_order(p, "SELL", bbo.best_bid, q)
+            elif pos < 0 and bbo.best_ask is not None:
+                self.api.place_order(p, "BUY", bbo.best_ask, q)
+
+    def step(self) -> dict:
+        now = time.monotonic()
+        if now - self._last_t < self.cooldown:
+            return {"act": "COOLDOWN"}
+
+        m1_mid = self.api.get_mid(self.m1)
+        m2_mid = self.api.get_mid(self.m2)
+        if np.isnan(m1_mid) or np.isnan(m2_mid):
+            return {"act": "NO_DATA"}
+
+        bbo1 = self.api.get_best_bid_ask(self.m1)
+        bbo2 = self.api.get_best_bid_ask(self.m2)
+        bid1, ask1 = bbo1.best_bid, bbo1.best_ask
+        bid2, ask2 = bbo2.best_bid, bbo2.best_ask
+
+        rv = self._rv.update(m1_mid)
+        if np.isnan(rv):
+            return {"act": "WARMUP", "z": float("nan"), "resid": float("nan"), "fair": float("nan")}
+
+        self._reg.add(m1_mid, rv, m2_mid)
+        self._reg.fit()
+
+        fair = self._reg.predict(m1_mid, rv)
+        resid = m2_mid - fair
+        if not np.isnan(resid):
+            self._res.add(resid)
+
+        mu = self._res.mean()
+        sd = self._res.std()
+        z = (resid - mu) / sd if (not np.isnan(sd) and sd > 1e-9) else float("nan")
+
+        pos2 = self.api.get_position(self.m2)
+        pos1 = self.api.get_position(self.m1)
+
+        # Exit when normalized: flatten both legs
+        if (not np.isnan(z)) and abs(z) < self.z_exit and (pos2 != 0 or pos1 != 0):
+            self._flatten(clip=10)
+            self._last_t = now
+            return {"act": "FLATTEN_EXIT", "z": z, "resid": resid, "fair": fair}
+
+        if np.isnan(z):
+            return {"act": "WARMUP", "z": z, "resid": resid, "fair": fair}
+
+        beta = self._reg.dy_dx()
+
+        # z high => M2 rich => SELL M2, hedge with M1
+        if z > self.z_enter:
+            room_sell2 = max(0, self.max_m2_pos + pos2)
+            if room_sell2 > 0 and bid2 is not None:
+                q2 = int(min(self.clip_m2, room_sell2))
+                self.api.place_order(self.m2, "SELL", bid2, q2)
+
+                hedge = int(np.clip(beta * q2, -self.clip_m1, self.clip_m1))
+                room_buy1  = max(0, self.max_m1_pos - pos1)
+                room_sell1 = max(0, self.max_m1_pos + pos1)
+                if hedge > 0 and room_buy1 > 0 and ask1 is not None:
+                    self.api.place_order(self.m1, "BUY",  ask1, int(min(hedge,  room_buy1)))
+                elif hedge < 0 and room_sell1 > 0 and bid1 is not None:
+                    self.api.place_order(self.m1, "SELL", bid1, int(min(-hedge, room_sell1)))
+
+                self._last_t = now
+                return {"act": f"SELL_M2 {q2} HEDGE {hedge}", "z": z, "beta": beta}
+
+        # z low => M2 cheap => BUY M2, hedge with M1
+        if z < -self.z_enter:
+            room_buy2 = max(0, self.max_m2_pos - pos2)
+            if room_buy2 > 0 and ask2 is not None:
+                q2 = int(min(self.clip_m2, room_buy2))
+                self.api.place_order(self.m2, "BUY", ask2, q2)
+
+                hedge = int(np.clip(beta * q2, -self.clip_m1, self.clip_m1))
+                room_buy1  = max(0, self.max_m1_pos - pos1)
+                room_sell1 = max(0, self.max_m1_pos + pos1)
+                if hedge > 0 and room_sell1 > 0 and bid1 is not None:
+                    self.api.place_order(self.m1, "SELL", bid1, int(min(hedge,  room_sell1)))
+                elif hedge < 0 and room_buy1 > 0 and ask1 is not None:
+                    self.api.place_order(self.m1, "BUY",  ask1, int(min(-hedge, room_buy1)))
+
+                self._last_t = now
+                return {"act": f"BUY_M2 {q2} HEDGE {hedge}", "z": z, "beta": beta}
+
+        return {"act": "HOLD", "z": z, "resid": resid, "fair": fair}
+
+
+# ---------------------------------------------------------------------------
+# Strategy F: UpDipBuyer — EWMA mean-reversion dip buyer
+# ---------------------------------------------------------------------------
+
+class UpDipBuyer:
+    """Mean-reversion dip buyer: enters long when price falls below its EWMA.
+
+    Suited for markets with structural upward drift (TIDE_SPOT at high tide,
+    WX_SPOT, WX_SUM) where sharp dislocations below the moving average
+    represent transient buying opportunities.
+
+    Exits by selling when the price reverts back near the EWMA.
+
+    Position limits:
+        max_pos — strategy-level soft cap.
+        BotExchangeAdapter enforces ±100 as the final hard backstop.
+    """
+
+    def __init__(
+        self,
+        api: BotExchangeAdapter,
+        product: str,
+        max_pos: int = 50,
+        clip: int = 8,
+        z_enter: float = 1.6,
+        z_take: float = 0.3,
+        cooldown: float = 0.2,
+    ):
+        self.api = api
+        self.product = product
+        self.max_pos = min(int(max_pos), api.HARD_LIMIT)
+        self.clip = int(clip)
+        self.z_enter = float(z_enter)
+        self.z_take = float(z_take)
+        self.cooldown = float(cooldown)
+        self._last_t = 0.0
+        self._ema = EWMA(alpha=0.06)
+        self._dev = Rolling(n=220)
+
+    def step(self) -> dict:
+        now = time.monotonic()
+        if now - self._last_t < self.cooldown:
+            return {"p": self.product, "act": "COOLDOWN"}
+
+        mid = self.api.get_mid(self.product)
+        if np.isnan(mid):
+            return {"p": self.product, "act": "NO_DATA"}
+
+        bbo = self.api.get_best_bid_ask(self.product)
+        bid, ask = bbo.best_bid, bbo.best_ask
+        pos = self.api.get_position(self.product)
+
+        m = self._ema.update(mid)
+        d = mid - m
+        self._dev.add(d)
+        sd = self._dev.std()
+        z = d / sd if (not np.isnan(sd) and sd > 1e-9) else float("nan")
+
+        if np.isnan(z):
+            return {"p": self.product, "act": "WARMUP", "z": z}
+
+        # Buy dips: mid << EWMA
+        if z < -self.z_enter:
+            room_buy = max(0, self.max_pos - pos)
+            if room_buy > 0 and ask is not None:
+                q = int(min(self.clip, room_buy))
+                if self.api.place_order(self.product, "BUY", ask, q):
+                    self._last_t = now
+                    return {"p": self.product, "act": f"BUY {q}", "z": z}
+
+        # Take profit: price has reverted back toward EWMA
+        if z > -self.z_take and pos > 0:
+            if bid is not None:
+                q = int(min(self.clip, pos))
+                if self.api.place_order(self.product, "SELL", bid, q):
+                    self._last_t = now
+                    return {"p": self.product, "act": f"TAKE {q}", "z": z}
+
+        return {"p": self.product, "act": "HOLD", "z": z}
 
 
 # ---------------------------------------------------------------------------
