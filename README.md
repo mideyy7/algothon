@@ -1,6 +1,7 @@
 # IMC Algothon 2026
 
-**Team:** AAKK
+**Team-Name:** AAKK
+**Members:** Ayo, Aayan, Kieran, Kyan
 
 
 ## Overview
