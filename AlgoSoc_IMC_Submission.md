@@ -93,7 +93,7 @@ class M2vsM1StatArbUpM1:
 ```
 
 ### C. Rolling OLS Co-Integration Pairs Arb (`LHR_COUNT` vs `LHR_INDEX`)
-*Recognizing that Market 5 and Market 6 are derived fundamentally from the same underlying PIHub Heathrow dataset, this engine calculates live covariance and variance to define the spread `M6 = Alpha + Beta(M5)`, executing when the residual breaks $\pm 2.2 Z$.*
+*Recognizing that Market 5 and Market 6 are mathematically constrained by the exact same physical capacity limits, this engine calculates live covariance and variance to define the spread `M6 = Alpha + Beta(M5)`, executing when the residual breaks $\pm 2.2 Z$.*
 
 ```python
 class RollingOLS2:

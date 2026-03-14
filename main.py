@@ -225,6 +225,8 @@ class IMCBot(BaseBot):
     # ── SSE callbacks ──────────────────────────────────────────────────────
 
     def on_orderbook(self, orderbook: OrderBook) -> None:
+        # EMERGENCY STOP: all algos explicitly halted
+        return
         """Called by the SSE thread on every orderbook update.
 
         Flow:
