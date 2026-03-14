@@ -1,18 +1,12 @@
-# IMC Algothon 2026 — Jump Trading Track
+# IMC Algothon 2026
 
 **Team:** AAKK
-**Category:** Novice
-**Focus:** Advanced Quantitative Modelling & Engineering Infrastructure
 
----
 
 ## Overview
 
 This repository is our submission for the [Imperial College AlgoSoc](https://algosoc.org) IMC Trading Hackathon (IMCity Challenge). The competition simulates a live exchange (CMI) where bots trade 8 London-data-derived financial products over a 24-hour market window (Saturday 12:00 → Sunday 12:00).
 
-Rather than hardcoding parameters or using basic moving averages, we built an institutional-grade, event-driven trading platform with five mathematically distinct strategies operating simultaneously across all 8 markets.
-
----
 
 ## The 8 Markets
 
@@ -133,9 +127,6 @@ Three parallel live API integrations:
 │   └── bot_template.py        # BaseBot class with CMI SSE stream
 ├── MAN/                       # Additional materials
 ├── submission_graphs/         # Strategy visualisations
-├── test_bot.py                # 145-test CI suite
-├── test_pipeline.py           # Data pipeline tests
-├── AlgoSoc_IMC_Submission.md  # Written submission document
 ├── jump.pdf                   # Full algorithm design document
 └── requirements.txt
 ```
@@ -152,13 +143,3 @@ pip install -r requirements.txt
 
 # Set API key for flight data
 echo "PIHUB_API_KEY=your_key_here" > .env
-
-# Run tests
-python -m pytest test_bot.py
-```
-
----
-
-## Submission Document
-
-See [`AlgoSoc_IMC_Submission.md`](AlgoSoc_IMC_Submission.md) for the written submission with inline code excerpts, and [`jump.pdf`](jump.pdf) for the full algorithm design document including strategy diagrams.
