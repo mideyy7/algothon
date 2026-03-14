@@ -5,7 +5,7 @@
 
 ## Overview
 
-This repository is our submission for the [Imperial College AlgoSoc](https://algosoc.org) IMC Trading Hackathon (IMCity Challenge). The competition simulates a live exchange (CMI) where bots trade 8 London-data-derived financial products over a 24-hour market window (Saturday 12:00 → Sunday 12:00).
+This repository is our submission for the Imperial College AlgoSoc IMC Trading Hackathon (IMCity Challenge). The competition simulates a live exchange (CMI) where bots trade 8 London-data-derived financial products over a 24-hour market window (Saturday 12:00 → Sunday 12:00).
 
 
 ## The 8 Markets
